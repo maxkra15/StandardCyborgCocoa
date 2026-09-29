@@ -47,6 +47,8 @@ struct Surfel {
 
 #ifndef __METAL_VERSION__
 
+#include <vector>
+
 #define METAL_REQUIRED_ALIGNMENT 4096
 
 typedef std::vector<Surfel> Surfels __attribute__((aligned(METAL_REQUIRED_ALIGNMENT)));
@@ -54,7 +56,6 @@ typedef std::vector<Surfel> Surfels __attribute__((aligned(METAL_REQUIRED_ALIGNM
 #ifdef DEBUG
 // To prevent std::vector from agressively inlining, which prevents inspection with lldb
 // https://stackoverflow.com/questions/39680320/printing-debugging-libc-stl-with-xcode-lldb
-#import <vector>
 template struct std::vector<Surfel>;
 #endif /* DEBUG */
 

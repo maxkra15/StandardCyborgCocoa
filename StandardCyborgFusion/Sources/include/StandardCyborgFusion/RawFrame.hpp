@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <vector>
 #import <standard_cyborg/sc3d/PerspectiveCamera.hpp>
 
 using namespace standard_cyborg;

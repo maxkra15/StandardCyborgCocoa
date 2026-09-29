@@ -27,6 +27,9 @@ typedef struct {
     CVPixelBufferRef _Nullable colorBuffer;
     
     CFAbsoluteTime assimilationTime;
+    NSInteger icpIterationCount;
+    float icpCorrespondenceError;
+    float icpUnusedIterationFraction;
 } SCAssimilatedFrameMetadata;
 
 extern simd_float3 EulerAnglesFromSCAssimilatedFrameMetadata(SCAssimilatedFrameMetadata metadata);

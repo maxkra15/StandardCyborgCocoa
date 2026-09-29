@@ -12,6 +12,7 @@
 #import <StandardCyborgFusion/PBFFinalStatistics.h>
 
 #import "PBFModel.hpp"
+#include "CameraTrackingMath.hpp"
 #import "PBFDefinitions.h"
 #import "crc32.hpp"
 #import "DebugLog.h"
@@ -148,18 +149,14 @@ static CameraVelocity _cameraVelocity(PBFAssimilatedFrameMetadata* previousFrame
     Vector3f previousZ = previousExtrinsicMatrixInverse.col(2).head<3>();
     Vector3f previousP = previousExtrinsicMatrixInverse.col(3).head<3>();
 
-#if DEBUG
-    // This is going to be running VERY slowly, so force-override the delta time to 1/30s
-    double deltaT = 1.0 / 30.0;
-#else
-    double deltaT = (double)(currentFrameMeta->timestamp - previousFrameMeta->timestamp);
-#endif
+    // Use measured time in every build, including after rejected/dropped frames.
+    double deltaT = cameraFrameInterval(previousFrameMeta->timestamp, currentFrameMeta->timestamp);
     
     return CameraVelocity{
         Vector3f(
-            acosf(currentX.dot(previousX)),
-            acosf(currentY.dot(previousY)),
-            acosf(currentZ.dot(previousZ)))
+            cameraAxisAngle(currentX.dot(previousX)),
+            cameraAxisAngle(currentY.dot(previousY)),
+            cameraAxisAngle(currentZ.dot(previousZ)))
             / deltaT,
         (currentP - previousP) / deltaT};
 }

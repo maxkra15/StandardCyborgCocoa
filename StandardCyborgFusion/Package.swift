@@ -30,11 +30,10 @@ let package = Package(
                 "ZipArchive",
             ],
             path: "Sources",
-            // resources: [
-            //     .process("StandardCyborgFusion/Models/SCEarLandmarking.mlmodel"),
-            //     .process("StandardCyborgFusion/Models/SCEarTrackingModel.mlmodel"),
-            //     .process("StandardCyborgFusion/Models/SCFootTrackingModel.mlmodel"),
-            // ],
+            // Eigen uses depth fusion, not the legacy ear/foot Vision classifiers.
+            // Exclude their models to avoid Xcode 27 installing generated headers
+            // into /usr/local/include for this Swift package target.
+            exclude: ["StandardCyborgFusion/Models"],
             publicHeadersPath: "include",
             cxxSettings: [
                 // Always optimize, even for debug builds, in order to be usable while debugging the rest of an app

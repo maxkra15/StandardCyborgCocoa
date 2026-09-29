@@ -21,6 +21,10 @@ SCAssimilatedFrameMetadataFromPBFAssimilatedFrameMetadata(PBFAssimilatedFrameMet
     metadata.viewMatrix = toSimdFloat4x4(pbfMetadata.viewMatrix);
 
     metadata.projectionMatrix = toSimdFloat4x4(pbfMetadata.projectionMatrix);
+    metadata.assimilationTime = pbfMetadata.timestamp;
+    metadata.icpIterationCount = pbfMetadata.icpIterationCount;
+    metadata.icpCorrespondenceError = pbfMetadata.correspondenceError;
+    metadata.icpUnusedIterationFraction = pbfMetadata.icpUnusedIterationFraction;
     metadata.colorBuffer = NULL;
     metadata.depthBuffer = NULL;
     

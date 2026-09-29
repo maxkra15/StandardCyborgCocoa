@@ -7,6 +7,7 @@
 
 #ifdef __cplusplus
 
+#include <vector>
 #import <Foundation/Foundation.h>
 #import <standard_cyborg/sc3d/Geometry.hpp>
 #import <StandardCyborgFusion/SCMesh.h>

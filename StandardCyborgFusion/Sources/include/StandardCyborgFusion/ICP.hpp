@@ -9,14 +9,13 @@
 
 #pragma once
 
+#include <vector>
+#include <memory>
 #import <standard_cyborg/math/Mat4x4.hpp>
 #import <standard_cyborg/math/Vec3.hpp>
 #import <standard_cyborg/sc3d/Geometry.hpp>
 
 #import <TargetConditionals.h>
-#if DEBUG
-#import <vector>
-#endif
 
 using namespace standard_cyborg;
 

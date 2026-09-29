@@ -41,6 +41,9 @@
 
 @property (nonatomic, readonly) simd_float3 gravity;
 
+/** Returns a cloud sharing the point buffer, with gravity in the same coordinate frame. */
+- (SCPointCloud * _Nonnull)pointCloudBySettingGravity:(simd_float3)gravity NS_SWIFT_NAME(settingGravity(_:));
+
 /** Computes the geometric mean of this point cloud */
 - (simd_float3)centerOfMass;
 

@@ -11,6 +11,8 @@
 #import <StandardCyborgFusion/SCReconstructionManagerParameters.h>
 
 #ifdef __cplusplus
+#include <vector>
+#include <memory>
 #import <StandardCyborgFusion/ICP.hpp>
 #import <StandardCyborgFusion/PBFAssimilatedFrameMetadata.hpp>
 #import <StandardCyborgFusion/RawFrame.hpp>

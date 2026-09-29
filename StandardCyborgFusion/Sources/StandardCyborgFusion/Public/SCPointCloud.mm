@@ -24,6 +24,15 @@
     return self;
 }
 
+- (SCPointCloud *)pointCloudBySettingGravity:(simd_float3)gravity
+{
+    SCPointCloud *cloud = [[SCPointCloud alloc] initWithSurfelData:_pointsData gravity:gravity];
+    cloud.intrinsicMatrix = self.intrinsicMatrix;
+    cloud.intrinsicMatrixReferenceDimensions = self.intrinsicMatrixReferenceDimensions;
+    cloud.depthFrameSize = self.depthFrameSize;
+    return cloud;
+}
+
 - (NSInteger)pointCount
 {
     return [_pointsData length] / [SCPointCloud pointStride];
