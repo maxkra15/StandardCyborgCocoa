@@ -456,16 +456,14 @@ public extension Notification.Name {
                     videoDevice.exposureMode = exposureMode
                 }
                 
-                if videoDevice.exposureDuration.seconds > self.minColorExposureDuration {
-                    // Decrease the exposure duration and increase the ISO to get us closer
-                    let scale = (videoDevice.exposureDuration.seconds / self.minColorExposureDuration).rounded()
-                    let newDuration = CMTimeMake(value: videoDevice.exposureDuration.value, timescale: Int32(scale) * videoDevice.exposureDuration.timescale)
-                    let newISO = videoDevice.iso * Float(scale)
-                    if newISO < videoDevice.activeFormat.maxISO {
-                        videoDevice.setExposureModeCustom(duration: newDuration,
-                                                          iso: newISO,
-                                                          completionHandler: nil)
-                    }
+                if videoDevice.isExposureModeSupported(.custom),
+                   let duration = CaptureTiming.boundedDuration(seconds: self.minColorExposureDuration,
+                       minimum: videoDevice.activeFormat.minExposureDuration,
+                       maximum: videoDevice.activeFormat.maxExposureDuration),
+                   let iso = CaptureTiming.compensatedISO(currentDuration: videoDevice.exposureDuration,
+                       targetDuration: duration, currentISO: videoDevice.iso,
+                       minimumISO: videoDevice.activeFormat.minISO, maximumISO: videoDevice.activeFormat.maxISO) {
+                    videoDevice.setExposureModeCustom(duration: duration, iso: iso, completionHandler: nil)
                 }
                 videoDevice.unlockForConfiguration()
             } catch {
