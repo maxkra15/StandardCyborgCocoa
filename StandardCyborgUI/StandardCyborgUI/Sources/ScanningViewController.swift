@@ -35,6 +35,11 @@ import UIKit
 
     /// Opt-in metric capture: sample gravity in the initial camera coordinate frame.
     public var usesDeviceMotionGravity = false
+    /// Set before loading the view. Legacy SDK users retain their historic calibration.
+    public var cameraFocalLengthScaleFactor: Float = 1.019
+    /// Delivered on main; describes accepted capture effort, never foot completeness.
+    public var onCaptureProgress: ((ScanCaptureProgress) -> Void)?
+    private var _captureLifetime = ScanCaptureLifetime()
     /// Zero retains the SDK's center-weighted cutoff. Metres otherwise.
     public var maximumReconstructionDepth: Float = 0
     /// Allow rejected frames to recover against the last good model before ending.
@@ -47,6 +52,8 @@ import UIKit
     public var maximumCaptureDistance: Float = 0.5
     private var _depthGuidance: ScanDepthGuidance?
     private var _lastDepthGuidanceTime: TimeInterval = 0
+    private var _lastReportedDepthMessage: String?
+    private var _lastDepthMessageTime: TimeInterval = 0
     private var _diagnostics: ScanDiagnosticsRecorder?
     private var _isCompletingCapture = false
     
@@ -102,11 +109,12 @@ import UIKit
     /** Starts scanning immediately */
     @objc public func startScanning() {
         guard !_isCompletingCapture else { return }
-        if minimumCaptureDistance > 0 && _depthGuidance?.allowsStart != true {
+        if minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
             _state = .default
             delegate?.scanningViewController?(self, captureGuidance: _depthGuidance?.message ?? "Aim at the whole foot and wait for depth detail.")
             return
         }
+        _captureLifetime.invalidate()
         _captureState.begin()
         _diagnostics = recordsScanDiagnostics ? ScanDiagnosticsRecorder() : nil
         if usesDeviceMotionGravity {
@@ -121,10 +129,22 @@ import UIKit
         meshTexturing.reset()
     }
 
+    /// An immutable observed-point snapshot for background geometry checks.
+    /// The caller must still validate geometry; elapsed time never establishes completeness.
+    @MainActor public func capturePointCloudSnapshot() -> SCPointCloud? {
+        guard _state == .scanning, !_isCompletingCapture,
+              !_captureState.isRecovering, let gravity = _captureState.gravity else { return nil }
+        let cloud = _reconstructionManager.buildPointCloud()
+        guard cloud.pointCount > 0 else { return nil }
+        return cloud.settingGravity(gravity)
+    }
+
     /** Stops scanning immediately */
     @objc public func stopScanning(reason: ScanningTerminationReason) {
+        if reason == .canceled { _captureLifetime.invalidate() }
         guard _state == _State.scanning else { return }
         
+        _captureLifetime.invalidate()
         _state = .default
         _latestViewMatrix = matrix_identity_float4x4
         _updateUI()
@@ -135,6 +155,7 @@ import UIKit
         }
         
         if reason == .finished {
+            let completionGeneration = _captureLifetime.generation
             _isCompletingCapture = true
             _cameraManager.stopSession()
             
@@ -144,6 +165,12 @@ import UIKit
             
             // Do final cleanup on the scan
             _reconstructionManager.finalize {
+                guard self._captureLifetime.accepts(completionGeneration) else {
+                    self._diagnostics = nil
+                    self._reconstructionManager.reset()
+                    self._isCompletingCapture = false
+                    return
+                }
                 let rawCloud = self._reconstructionManager.buildPointCloud()
                 let pointCloud: SCPointCloud
                 if self.usesDeviceMotionGravity, let gravity = self._captureState.gravity {
@@ -153,6 +180,7 @@ import UIKit
                     self._finishDiagnostics(rawCloud.settingGravity(.zero), reason: message) {
                         self._reconstructionManager.reset()
                         self._isCompletingCapture = false
+                        guard self._captureLifetime.accepts(completionGeneration) else { return }
                         self.delegate?.scanningViewController?(self, didFail: message)
                     }
                     return
@@ -163,6 +191,7 @@ import UIKit
                 self._finishDiagnostics(pointCloud, reason: "Capture finished; geometry not yet validated") {
                     self._reconstructionManager.reset()
                     self._isCompletingCapture = false
+                    guard self._captureLifetime.accepts(completionGeneration) else { return }
                     self.delegate?.scanningViewController?(self, didScan: pointCloud)
                 }
             }
@@ -224,6 +253,7 @@ import UIKit
         _cameraManager.configureCaptureSession(maxResolution: maxDepthResolution)
         
         _reconstructionManager.delegate = self
+        _reconstructionManager.cameraFocalLengthScaleFactor = cameraFocalLengthScaleFactor
         if reconstructionIterationLimit > 0 { _reconstructionManager.maxICPIterations = reconstructionIterationLimit }
         if maximumReconstructionDepth > 0 {
             _reconstructionManager.maxDepth = maximumReconstructionDepth
@@ -247,6 +277,7 @@ import UIKit
     override open func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         
+        _captureLifetime.invalidate()
         stopScanning(reason: ScanningViewController.ScanningTerminationReason.canceled)
         
         _cameraManager.stopSession()
@@ -316,28 +347,48 @@ import UIKit
     
     public func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData) {
         var isScanning = false
+        var shouldAccumulate = false
+        var generation: UInt = 0
+        var viewMatrix = matrix_identity_float4x4
         DispatchQueue.main.sync {
-            isScanning = self._state == _State.scanning
+            isScanning = self._state == .scanning
+            generation = self._captureLifetime.generation
+            viewMatrix = self._latestViewMatrix
+            let now = ProcessInfo.processInfo.systemUptime
             if self.minimumCaptureDistance > 0 {
-                let now = ProcessInfo.processInfo.systemUptime
-                if now - self._lastDepthGuidanceTime >= 0.25 {
-                    self._lastDepthGuidanceTime = now
-                    self._updateDepthGuidance(depthBuffer)
+                self._updateDepthGuidance(depthBuffer)
+                self._lastDepthGuidanceTime = now
+            }
+            shouldAccumulate = isScanning
+            if isScanning {
+                // Preserve raw evidence even when a depth frame is withheld from fusion.
+                self._diagnostics?.recordDepth(depthBuffer, calibration: depthCalibrationData)
+                if self.minimumCaptureDistance > 0 {
+                    let wasRecovering = self._captureState.isRecovering
+                    let usable = self._depthGuidance?.allowsStart == true
+                    let expired = self._captureState.updateDepthUsable(usable, now: now, grace: 8)
+                    shouldAccumulate = usable
+                    if !usable && !wasRecovering {
+                        self.delegate?.scanningViewController?(self, trackingIsStable: false)
+                    }
+                    if expired {
+                        self._failCapture("Depth detail did not recover. Keep the whole foot and some floor visible at about 30–40 cm, then try again.")
+                        shouldAccumulate = false
+                    }
+                    self._publishCaptureProgress()
                 }
             }
-            // The fused model uses the first depth frame as its reference. Freeze gravity
-            // here, not at completion after the helper has moved around the foot.
-            if isScanning && self.usesDeviceMotionGravity && self._captureState.gravity == nil {
+            // Freeze gravity at the first depth frame actually submitted to fusion.
+            if shouldAccumulate && self.usesDeviceMotionGravity && self._captureState.gravity == nil {
                 if let motion = self._motionManager.deviceMotion {
                     let g = motion.gravity
-                    isScanning = self._captureState.recordInitialGravity(SIMD3(Float(g.x), Float(g.y), Float(g.z)))
+                    shouldAccumulate = self._captureState.recordInitialGravity(SIMD3(Float(g.x), Float(g.y), Float(g.z)))
                 } else {
-                    isScanning = false
+                    shouldAccumulate = false
                 }
             }
-            if isScanning { self._diagnostics?.recordDepth(depthBuffer, calibration: depthCalibrationData) }
         }
-        
+
         let pointCloud: SCPointCloud
         
         if isScanning {
@@ -356,13 +407,18 @@ import UIKit
         scanningViewRenderer.draw(colorBuffer: colorBuffer,
                                   pointCloud: pointCloud,
                                   depthCameraCalibrationData: depthCalibrationData,
-                                  viewMatrix: _latestViewMatrix,
+                                  viewMatrix: viewMatrix,
                                   into: _metalLayer)
         
-        if isScanning {
-            _reconstructionManager.accumulate(depthBuffer: depthBuffer,
-                                              colorBuffer: colorBuffer,
-                                              calibrationData: depthCalibrationData)
+        if shouldAccumulate {
+            // Rendering can outlive a stop/finalize. Never enqueue that stale camera frame.
+            DispatchQueue.main.sync {
+                guard self._state == .scanning, !self._isCompletingCapture,
+                      self._captureLifetime.accepts(generation) else { return }
+                self._reconstructionManager.accumulate(depthBuffer: depthBuffer,
+                                                       colorBuffer: colorBuffer,
+                                                       calibrationData: depthCalibrationData)
+            }
         }
     }
     
@@ -379,8 +435,13 @@ import UIKit
             for x in stride(from: width / 6, to: width * 5 / 6, by: 6) { samples.append(row[x]) }
         }
         let guidance = ScanDepthGuidance(samples: samples, minimumDistance: minimumCaptureDistance, maximumDistance: maximumCaptureDistance)
+        let now = ProcessInfo.processInfo.systemUptime
+        if _lastReportedDepthMessage != guidance.message && now - _lastDepthMessageTime >= 0.25 {
+            _lastReportedDepthMessage = guidance.message
+            _lastDepthMessageTime = now
+            delegate?.scanningViewController?(self, captureGuidance: guidance.message)
+        }
         _depthGuidance = guidance
-        delegate?.scanningViewController?(self, captureGuidance: guidance.message)
     }
 
     // MARK: - SCReconstructionManagerDelegate
@@ -389,6 +450,8 @@ import UIKit
         guard _state == .scanning else { return }
         
         _diagnostics?.recordTracking(metadata, statistics: statistics)
+        // Late metadata from a frame queued before a depth pause cannot clear that pause.
+        guard !_captureState.isDepthPaused else { _publishCaptureProgress(); return }
         switch metadata.result {
         case .succeeded, .poorTracking:
             _latestViewMatrix = metadata.viewMatrix
@@ -396,6 +459,8 @@ import UIKit
                 delegate?.scanningViewController?(self, trackingIsStable: true)
             }
             _captureState.trackingRecovered()
+            _captureState.recordAccepted(now: ProcessInfo.processInfo.systemUptime, viewMatrix: metadata.viewMatrix)
+            _publishCaptureProgress()
             // Save off every nth frame
             if
                 generatesTexturedMeshes
@@ -425,6 +490,7 @@ import UIKit
         @unknown default:
             break
         }
+        _publishCaptureProgress()
     }
     
     public func reconstructionManager(_ manager: SCReconstructionManager, didEncounterAPIError error: Error) {
@@ -432,11 +498,24 @@ import UIKit
         _failCapture("The depth camera was interrupted. Close the scanner and try again.")
     }
 
+    public func cameraManager(_ manager: CameraManager, didInterrupt message: String) {
+        if _state == .scanning { _failCapture(message) }
+    }
+
+    private func _publishCaptureProgress() {
+        let guidance = _captureState.isDepthPaused ? _depthGuidance?.message :
+            (_captureState.isRecovering ? "Return to the last angle and move slowly." : nil)
+        onCaptureProgress?(_captureState.progress(guidance: guidance))
+    }
+
     private func _finishDiagnostics(_ cloud: SCPointCloud, reason: String, completion: @escaping () -> Void) {
         guard let recorder = _diagnostics else { completion(); return }
         _diagnostics = nil
-        recorder.write(cloud: cloud, reason: reason, maximumDepth: maximumReconstructionDepth, iterationLimit: Int(_reconstructionManager.maxICPIterations)) { url in
-            if let url = url { self.delegate?.scanningViewController?(self, didWriteDiagnostics: url) }
+        let diagnosticGeneration = _captureLifetime.generation
+        recorder.write(cloud: cloud, reason: reason, maximumDepth: maximumReconstructionDepth, iterationLimit: Int(_reconstructionManager.maxICPIterations), focalLengthScaleFactor: cameraFocalLengthScaleFactor) { url in
+            if self._captureLifetime.accepts(diagnosticGeneration), let url = url {
+                self.delegate?.scanningViewController?(self, didWriteDiagnostics: url)
+            }
             completion()
         }
     }
@@ -450,15 +529,24 @@ import UIKit
         }
         // Snapshot only after the model queue is quiescent; reset would destroy the evidence.
         _isCompletingCapture = true
+        _captureLifetime.invalidate()
+        let completionGeneration = _captureLifetime.generation
         _state = .default
         _updateUI()
         _cameraManager.stopSession()
         _reconstructionManager.finalize {
+            guard self._captureLifetime.accepts(completionGeneration) else {
+                self._diagnostics = nil
+                self._reconstructionManager.reset()
+                self._isCompletingCapture = false
+                return
+            }
             let cloud = self._reconstructionManager.buildPointCloud().settingGravity(self._captureState.gravity ?? .zero)
             self._finishDiagnostics(cloud, reason: message) {
                 self._reconstructionManager.reset()
                 self.meshTexturing.reset()
                 self._isCompletingCapture = false
+                guard self._captureLifetime.accepts(completionGeneration) else { return }
                 if self.delegate?.scanningViewController?(self, didFail: message) == nil { self._showScanFailedMessage() }
             }
         }

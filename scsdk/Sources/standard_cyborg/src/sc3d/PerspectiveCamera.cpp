@@ -50,6 +50,8 @@ static math::Vec4 computeLensDistortionCurveFit(const std::vector<float>& table)
     // In practice, this should be evaluated using Horner's method as
     //   y(x) = x^2*(c0 + x*(c1 + x*(c2 + x*c3)))
     size_t n = table.size();
+    // Missing calibration means identity distortion, not an underdetermined QR solve.
+    if (n < 4) { return math::Vec4 {0, 0, 0, 0}; }
     Eigen::MatrixXf A (n, 4);
     Eigen::VectorXf b (n);
     for (off_t i = 0; i < n; i++) {
@@ -153,6 +155,8 @@ void PerspectiveCamera::copy(const PerspectiveCamera& other)
     setLensDistortionLookupTable(other.getLensDistortionCalibration());
     setInverseLensDistortionLookupTable(other.getInverseLensDistortionCalibration());
     setFrame(other.getFrame());
+    hasLensDistortionCenter = other.hasLensDistortionCenter;
+    lensDistortionCenter = other.lensDistortionCenter;
 }
 
 int PerspectiveCamera::getSizeInBytes() const
@@ -233,6 +237,23 @@ Vec2 PerspectiveCamera::getOpticalImageCenter() const
     return Vec2 { intrinsicMatrix.m02, intrinsicMatrix.m12 };
 }
 
+void PerspectiveCamera::setLensDistortionCenter(Vec2 center)
+{
+    hasLensDistortionCenter = std::isfinite(center.x) && std::isfinite(center.y);
+    lensDistortionCenter = center;
+}
+
+Vec2 PerspectiveCamera::getLensDistortionCenter() const
+{
+    return hasLensDistortionCenter ? lensDistortionCenter : getOpticalImageCenter();
+}
+
+float PerspectiveCamera::getLensDistortionMaxRadius() const
+{
+    Vec2 center = getLensDistortionCenter();
+    return Vec2::max(center, getIntrinsicMatrixReferenceSize() - center).norm();
+}
+
 float PerspectiveCamera::getOpticalImageMaxRadius() const
 {
     Vec2 center = getOpticalImageCenter();
@@ -261,6 +282,7 @@ bool PerspectiveCamera::operator==(const PerspectiveCamera& other) const {
         focalLengthScaleFactor == other.focalLengthScaleFactor &&
         intrinsicMatrixReferenceSize == other.intrinsicMatrixReferenceSize &&
         nominalIntrinsicMatrix == other.nominalIntrinsicMatrix &&
+        getLensDistortionCenter() == other.getLensDistortionCenter() &&
         // intrinsicMatrix == other.intrinsicMatrix &&
         extrinsicMatrix == other.extrinsicMatrix &&
         orientationMatrix == other.orientationMatrix &&

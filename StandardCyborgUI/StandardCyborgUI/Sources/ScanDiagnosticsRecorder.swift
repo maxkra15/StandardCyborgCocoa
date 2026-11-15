@@ -57,14 +57,16 @@ final class ScanDiagnosticsRecorder {
         ])
     }
 
-    func write(cloud: SCPointCloud, reason: String, maximumDepth: Float, iterationLimit: Int = 0, completion: @escaping (URL?) -> Void) {
+    func write(cloud: SCPointCloud, reason: String, maximumDepth: Float, iterationLimit: Int = 0, focalLengthScaleFactor: Float = 1.019, completion: @escaping (URL?) -> Void) {
         let gravity = cloud.gravity
         var report: [String: Any] = [
             "format": "eigen-scan-diagnostics", "version": 1,
             "createdAt": ISO8601DateFormatter().string(from: Date()),
             "device": UIDevice.current.model, "systemVersion": UIDevice.current.systemVersion,
             "reason": reason, "maximumDepthMetres": maximumDepth,
-            "icpIterationLimit": iterationLimit, "captureImplementation": "eigen-distance-guidance-1",
+            "icpIterationLimit": iterationLimit, "captureImplementation": "eigen-metric-capture-2",
+            "focalLengthScaleFactor": focalLengthScaleFactor,
+            "lensCorrectionCenter": "AVCameraCalibrationData.lensDistortionCenter (distinct from principal point)",
             "gravity": numbers([gravity.x, gravity.y, gravity.z]),
             "depthFrames": frames, "trackingEvents": events,
             "pointCount": cloud.pointCount,

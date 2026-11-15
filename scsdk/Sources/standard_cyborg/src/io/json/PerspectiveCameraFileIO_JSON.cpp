@@ -129,9 +129,13 @@ bool ReadPerspectiveCameraFromJSON(sc3d::PerspectiveCamera& camera, const JSON& 
         camera.setLensDistortionLookupTable(json["lens_distortion_lookup_table"]);
     }
     
-    if (json.contains("lensDistortionLookupTable")) {
+    if (json.contains("lensDistortionCenter")) {
+        camera.setLensDistortionCenter(Vec2{json["lensDistortionCenter"][0], json["lensDistortionCenter"][1]});
+    }
+
+    if (json.contains("inverseLensDistortionLookupTable")) {
         camera.setInverseLensDistortionLookupTable(json["inverseLensDistortionLookupTable"]);
-    } else if (json.contains("lens_distortion_lookup_table")) {
+    } else if (json.contains("inverse_lens_distortion_lookup_table")) {
         // Handle legacy BPLY files without immediately having to rewrite everything
         camera.setInverseLensDistortionLookupTable(json["inverse_lens_distortion_lookup_table"]);
     }
@@ -164,6 +168,10 @@ bool WritePerspectiveCameraToJSON(JSON& json, const sc3d::PerspectiveCamera& cam
     json["orientationMatrix"] = camera.getOrientationMatrix().toColumnMajorVector();
     json["nominalIntrinsicMatrix"] = camera.getNominalIntrinsicMatrix().toColumnMajorVector();
     json["focalLengthScaleFactor"] = camera.getFocalLengthScaleFactor();
+    const auto distortionCenter = camera.getLensDistortionCenter();
+    json["lensDistortionCenter"] = std::vector<float>{distortionCenter.x, distortionCenter.y};
+    json["lensDistortionLookupTable"] = camera.getLensDistortionCalibration();
+    json["inverseLensDistortionLookupTable"] = camera.getInverseLensDistortionCalibration();
     json["intrinsicMatrixReferenceSize"] = std::vector<float>{
         camera.getIntrinsicMatrixReferenceSize().x,
         camera.getIntrinsicMatrixReferenceSize().y

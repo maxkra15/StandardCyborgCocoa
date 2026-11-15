@@ -28,8 +28,8 @@ struct ComputeNormalsKernelUniforms {
         resolution.y = 1.0f / height;
         
         opticalImageSize = toSimdFloat2(camera.getIntrinsicMatrixReferenceSize());
-        opticalImageCenter = toSimdFloat2(camera.getOpticalImageCenter());
-        maxLensCalibrationRadius = camera.getOpticalImageMaxRadius();
+        opticalImageCenter = toSimdFloat2(camera.getLensDistortionCenter());
+        maxLensCalibrationRadius = camera.getLensDistortionMaxRadius();
         lensDistortionConstants = toSimdFloat4(camera.getLensDistortionCurveFit());
         viewMatrixInverse = toSimdFloat4x4(camera.getViewMatrixInverse());
         intrinsicMatrixInv = toSimdFloat3x3(camera.getIntrinsicMatrixInverse());

@@ -63,8 +63,8 @@ struct SharedUniforms {
         
         inverseLensDistortionConstants = toSimdFloat4(camera.getInverseLensDistortionCurveFit());
         opticalImageSize = toSimdFloat2(camera.getIntrinsicMatrixReferenceSize());
-        opticalImageCenter = toSimdFloat2(camera.getOpticalImageCenter());
-        maxLensCalibrationRadius = camera.getOpticalImageMaxRadius();
+        opticalImageCenter = toSimdFloat2(camera.getLensDistortionCenter());
+        maxLensCalibrationRadius = camera.getLensDistortionMaxRadius();
     }
 };
 

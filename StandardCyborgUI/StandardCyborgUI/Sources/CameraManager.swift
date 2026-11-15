@@ -12,6 +12,7 @@ import UIKit
 
 @objc public protocol CameraManagerDelegate: AnyObject {
     func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData)
+    @objc optional func cameraManager(_ manager: CameraManager, didInterrupt message: String)
     @objc optional func cameraManagerDidStartSession(_ manager: CameraManager)
     @objc optional func cameraManagerDidNotStartSession(_ manager: CameraManager, result: CameraManager.SessionSetupResult)
 }
@@ -39,7 +40,7 @@ public extension Notification.Name {
         quality 3D reconstruction.
      */
     @objc public class var isDepthCameraAvailable: Bool {
-        return ARFaceTrackingConfiguration.isSupported
+        return AVCaptureDevice.default(.builtInTrueDepthCamera, for: .video, position: .front) != nil
     }
     
     @objc public class var isCameraPermissionDenied: Bool {
@@ -203,6 +204,7 @@ public extension Notification.Name {
     private var _sessionRunningContext = 0
     
     private func _addObservers() {
+        guard !_hasAddedObservers else { return }
         guard let videoDevice = _videoDeviceInput?.device else {
             print("Video device input was nil")
             return
@@ -244,6 +246,9 @@ public extension Notification.Name {
     }
     
     @objc private func sessionWasInterrupted(notification: Notification) {
+        DispatchQueue.main.async {
+            self.delegate?.cameraManager?(self, didInterrupt: "The camera was interrupted. Keep Eigen open and try the scan again.")
+        }
         if let userInfoValue = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as AnyObject?,
             let reasonIntegerValue = userInfoValue.integerValue,
             let reason = AVCaptureSession.InterruptionReason(rawValue: reasonIntegerValue) {
@@ -261,6 +266,9 @@ public extension Notification.Name {
         
         let error = AVError(_nsError: errorValue)
         print("Capture session runtime error: \(error)")
+        DispatchQueue.main.async {
+            self.delegate?.cameraManager?(self, didInterrupt: "The depth camera stopped. Close the scanner and try again.")
+        }
         
         // Automatically try to restart the session running if media services were reset and the last start running succeeded.
         // Otherwise, enable the user to try to resume the session running.
@@ -282,6 +290,9 @@ public extension Notification.Name {
     }
     
     @objc private func didEnterBackground(notification: Notification) {
+        DispatchQueue.main.async {
+            self.delegate?.cameraManager?(self, didInterrupt: "The scan was paused when Eigen left the screen. Try again with Eigen open.")
+        }
         // Free up resources
         _dataOutputQueue.async {
             self._dataOutputQueue_renderingEnabled = false
@@ -313,19 +324,21 @@ public extension Notification.Name {
               !syncedVideoData.sampleBufferWasDropped
         else { return }
         
-        let depthData = syncedDepthData.depthData
+        // The fusion code consumes metric Float32, never disparity or Float16.
+        let depthData = syncedDepthData.depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
         let depthBuffer = depthData.depthDataMap
         let sampleBuffer = syncedVideoData.sampleBuffer
         guard let colorBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let depthCalibrationData = depthData.cameraCalibrationData
         else { return }
         
-        delegate.cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData)
+        delegate?.cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData)
     }
     
     // MARK: - Private
     
     private func _sessionQueue_configureSession(maxResolution: Int, maxFramerate: Int) -> SessionSetupResult {
+        guard maxResolution > 0, maxFramerate > 0 else { return .configurationFailed }
         guard let videoDevice = _videoDeviceDiscoverySession.devices.first else {
             print("Could not find any video device")
             return .configurationFailed
@@ -358,6 +371,10 @@ public extension Notification.Name {
         }
         
         _captureSession.beginConfiguration()
+        guard _captureSession.canSetSessionPreset(colorCaptureSessionPreset) else {
+            _captureSession.commitConfiguration()
+            return .configurationFailed
+        }
         _captureSession.sessionPreset = colorCaptureSessionPreset
         _captureSession.addInput(_videoDeviceInput!)
         if !_captureSession.outputs.contains(_videoDataOutput) {
@@ -388,11 +405,21 @@ public extension Notification.Name {
               < CMVideoFormatDescriptionGetDimensions(second.formatDescription).width
         }
         
+        guard let selectedFormat,
+              let rateRange = selectedFormat.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }),
+              let frameDuration = CaptureTiming.boundedDuration(seconds: 1.0 / Double(maxFramerate),
+                  minimum: rateRange.minFrameDuration, maximum: rateRange.maxFrameDuration),
+              let exposureDuration = CaptureTiming.boundedDuration(seconds: minColorExposureDuration,
+                  minimum: videoDevice.activeFormat.minExposureDuration, maximum: videoDevice.activeFormat.maxExposureDuration) else {
+            _captureSession.commitConfiguration()
+            return .configurationFailed
+        }
+
         do {
             try videoDevice.lockForConfiguration()
             videoDevice.activeDepthDataFormat = selectedFormat
-            videoDevice.activeDepthDataMinFrameDuration = CMTimeMake(value: 1, timescale: Int32(maxFramerate))
-            videoDevice.activeMaxExposureDuration = CMTimeMake(value: 1, timescale: Int32(minColorExposureDuration))
+            videoDevice.activeDepthDataMinFrameDuration = frameDuration
+            videoDevice.activeMaxExposureDuration = exposureDuration
             videoDevice.isSubjectAreaChangeMonitoringEnabled = false
             videoDevice.unlockForConfiguration()
         } catch {

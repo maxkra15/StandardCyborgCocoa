@@ -28,6 +28,7 @@
 #import "SCReconstructionManager_Private.h"
 
 #import <iostream>
+#include <cmath>
 #import <objc/runtime.h>
 
 #import "GravityEstimator.hpp"
@@ -39,11 +40,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface _IncomingFrameData : NSObject
 @property (nonatomic, readonly) int sequence;
+@property (nonatomic, readonly) NSUInteger captureEpoch;
 @property (nonatomic, readonly) CVPixelBufferRef depthBuffer;
 @property (nonatomic, readonly) CVPixelBufferRef colorBuffer;
 @property (nonatomic, readonly) AVCameraCalibrationData *calibrationData;
 
 - (instancetype)initWithSequence:(int)sequence
+                        captureEpoch:(NSUInteger)captureEpoch
                      depthBuffer:(CVPixelBufferRef)depthBuffer
                      colorBuffer:(CVPixelBufferRef)colorBuffer
                  calibrationData:(AVCameraCalibrationData *)calibrationData;
@@ -53,6 +56,7 @@ NS_ASSUME_NONNULL_BEGIN
 @implementation _IncomingFrameData
 
 - (instancetype)initWithSequence:(int)sequence
+                        captureEpoch:(NSUInteger)captureEpoch
                      depthBuffer:(CVPixelBufferRef)depthBuffer
                      colorBuffer:(CVPixelBufferRef)colorBuffer
                  calibrationData:(AVCameraCalibrationData *)calibrationData
@@ -63,6 +67,7 @@ NS_ASSUME_NONNULL_BEGIN
         NSParameterAssert(colorBuffer);
         NSParameterAssert(calibrationData);
         _sequence = sequence;
+        _captureEpoch = captureEpoch;
         _depthBuffer = CVPixelBufferRetain(depthBuffer);
         _colorBuffer = CVPixelBufferRetain(colorBuffer);
         _calibrationData = calibrationData;
@@ -90,6 +95,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 // MARK: -
 
+@interface SCReconstructionManager ()
+@property (atomic, strong) SCPointCloud *publishedPointCloudSnapshot;
+@property (atomic) NSUInteger captureEpoch;
+@end
+
 @implementation SCReconstructionManager {
     PBFConfiguration _pbfConfig;
     ICPConfiguration _icpConfig;
@@ -101,11 +111,14 @@ NS_ASSUME_NONNULL_BEGIN
     int _inputQueue_incomingFrameSequence;
     SCReconstructionManagerStatistics _inputQueue_statistics;
     BOOL _inputQueue_stopped;
+    BOOL _inputQueue_resetPending;
     BOOL _inputQueue_shuttingDown;
     
     dispatch_queue_t _modelQueue;
     PBFModel *_modelQueue_model;
     MetalDepthProcessor *_modelQueue_depthProcessor;
+    MetalDepthProcessor *_previewDepthProcessor;
+    NSLock *_previewLock;
     ProcessedFrame *_modelQueue_frame;
     float _modelQueue_maxDepth;
     BOOL _userSetMaxDepth;
@@ -122,6 +135,8 @@ NS_ASSUME_NONNULL_BEGIN
 {
     self = [super init];
     if (self) {
+        _publishedPointCloudSnapshot = [[SCPointCloud alloc] initWithSurfelData:[NSData data] gravity:simd_make_float3(0, -1, 0)];
+        _cameraFocalLengthScaleFactor = 1.019f;
         _wroteIntrinsicsToFile = NO;
         _inputQueue_stopped = YES;
 
@@ -139,6 +154,9 @@ NS_ASSUME_NONNULL_BEGIN
         _icpConfig.tolerance = [[NSUserDefaults standardUserDefaults] floatForKey:@"icp_tolerance"] ?: _icpConfig.tolerance;
         
         _modelQueue_depthProcessor = new MetalDepthProcessor(device, library, commandQueue);
+        // Preview and fusion have different queue owners and must not share mutable buffers/kernels.
+        _previewDepthProcessor = new MetalDepthProcessor(device, library, commandQueue);
+        _previewLock = [[NSLock alloc] init];
         
         _modelQueue = dispatch_queue_create("SCReconstructionManager._modelQueue",
                                             dispatch_queue_attr_make_with_qos_class(NULL, QOS_CLASS_USER_INTERACTIVE, 0));
@@ -167,6 +185,7 @@ NS_ASSUME_NONNULL_BEGIN
     
     delete _modelQueue_frame;
     delete _modelQueue_depthProcessor;
+    delete _previewDepthProcessor;
     delete _modelQueue_model;
 }
 
@@ -292,6 +311,7 @@ NS_ASSUME_NONNULL_BEGIN
                            withCalibrationData:(AVCameraCalibrationData *)calibrationData
                                smoothingPoints:(BOOL)smoothPoints
 {
+    [_previewLock lock];
     size_t width = CVPixelBufferGetWidth(depthBuffer);
     size_t height = CVPixelBufferGetHeight(depthBuffer);
     size_t depthCount = width * height;
@@ -300,7 +320,7 @@ NS_ASSUME_NONNULL_BEGIN
     _latestCameraCalibrationFrameWidth = (int)width;
     _latestCameraCalibrationFrameHeight = (int)height;
     
-    sc3d::PerspectiveCamera camera = PerspectiveCameraFromAVCameraCalibrationData(calibrationData, width, height);
+    sc3d::PerspectiveCamera camera = PerspectiveCameraFromAVCameraCalibrationData(calibrationData, width, height, _cameraFocalLengthScaleFactor);
     RawFrame rawFrame(camera, width, height);
     
     if (colorBuffer == NULL) {
@@ -329,7 +349,7 @@ NS_ASSUME_NONNULL_BEGIN
         maxDepth = kCenterDepthExpansionRatio * CVPixelBufferAverageDepthAroundCenter(depthBuffer);
     }
     
-    _modelQueue_depthProcessor->computeFrameValues(frame, rawFrame, smoothPoints);
+    _previewDepthProcessor->computeFrameValues(frame, rawFrame, smoothPoints);
     
     // This is the maximum size it can possibly be, but it will likely be less than this
     size_t resultSize = depthCount * sizeof(Surfel);
@@ -340,7 +360,7 @@ NS_ASSUME_NONNULL_BEGIN
     
     for (size_t i = 0; i < depthCount; ++i) {
         float depth = rawFrame.depths[i];
-        if (!isnan(depth) && depth < maxDepth) {
+        if (std::isfinite(depth) && depth > 0 && depth < maxDepth) {
             Surfel surfel;
             surfel.position = toVector3f(frame.positions[i]);
             surfel.color = toVector3f(rawFrame.colors[i]);
@@ -360,6 +380,7 @@ NS_ASSUME_NONNULL_BEGIN
 
     pointCloud.depthFrameSize = toSimdFloat2(math::Vec2(rawFrame.width, rawFrame.height));
 
+    [_previewLock unlock];
     return pointCloud;
 }
 
@@ -372,10 +393,18 @@ NS_ASSUME_NONNULL_BEGIN
     CVPixelBufferRetain(colorBuffer);
     
     dispatch_async(_inputQueue, ^{
+        // Reset is queued behind the continuous model loop. Do not restart that
+        // loop with new frames until its old model has actually been discarded.
+        if (_inputQueue_resetPending) {
+            CVPixelBufferRelease(depthBuffer);
+            CVPixelBufferRelease(colorBuffer);
+            return;
+        }
         _inputQueue_stopped = NO;
         
         int sequence = _inputQueue_incomingFrameSequence++;
         _IncomingFrameData *data = [[_IncomingFrameData alloc] initWithSequence:sequence
+                                                                   captureEpoch:self.captureEpoch
                                                                     depthBuffer:depthBuffer
                                                                     colorBuffer:colorBuffer
                                                                 calibrationData:calibrationData];
@@ -422,27 +451,25 @@ NS_ASSUME_NONNULL_BEGIN
         
         dispatch_async(_modelQueue, ^{
             _modelQueue_model->finishAssimilating(_surfelFusionConfig);
+            [self _modelQueue_publishPointCloud];
             dispatch_async(dispatch_get_main_queue(), completion);
         });
     });
 }
 
+- (void)_modelQueue_publishPointCloud
+{
+    // Only the model queue may read the mutable vector. NSData owns this copy for
+    // the entire renderer/GPU lifetime, even if fusion reallocates or resets it.
+    const Surfels& surfels = _modelQueue_model->getSurfels();
+    NSData *data = [NSData dataWithBytes:surfels.data() length:surfels.size() * sizeof(Surfel)];
+    self.publishedPointCloudSnapshot = [[SCPointCloud alloc] initWithSurfelData:data gravity:[self gravity]];
+}
+
 - (SCPointCloud *)buildPointCloud
 {
-    // TODO: Fix threading/queuing and run off of a copy in PBFModel
-    const Surfels& surfels = _modelQueue_model->getSurfels();
-    NSData *surfelData;
-    if (_finalized) {
-        surfelData = [NSData dataWithBytes:(void *)surfels.data() length:surfels.size() * sizeof(Surfel)];
-    } else {
-        // While scanning, for the sake of performance, avoid copying the whole surfels data structure and return it directly
-        // This is an obvious thread safety issue, but we tend to get away with it 99+% of the time, so it's acceptable for now
-        surfelData = [NSData dataWithBytesNoCopy:(void *)surfels.data() length:surfels.size() * sizeof(Surfel) freeWhenDone:NO];
-    }
-    
-    simd_float3 gravity = [self gravity];
-    
-    return [[SCPointCloud alloc] initWithSurfelData:surfelData gravity:gravity];
+    // An atomic retained immutable snapshot; never wait for the continuous model loop.
+    return self.publishedPointCloudSnapshot;
 }
 
 - (void)reset
@@ -450,6 +477,8 @@ NS_ASSUME_NONNULL_BEGIN
     _finalized = NO;
     
     dispatch_sync(_inputQueue, ^{
+        self.captureEpoch += 1;
+        _inputQueue_resetPending = YES;
         _inputQueue_incomingFrameData = nil;
         _inputQueue_incomingFrameSequence = 0;
         _inputQueue_statistics = SCReconstructionManagerStatistics();
@@ -458,6 +487,13 @@ NS_ASSUME_NONNULL_BEGIN
         dispatch_async(_modelQueue, ^{
             _modelQueue_hasCalculatedModelConfig = NO;
             _modelQueue_model->reset();
+            [self _modelQueue_publishPointCloud];
+            dispatch_async(_inputQueue, ^{
+                // Old in-flight assimilation may have updated statistics after
+                // reset was requested; clear them only after it has drained.
+                _inputQueue_statistics = SCReconstructionManagerStatistics();
+                _inputQueue_resetPending = NO;
+            });
         });
         
         // Allows _modelQueue to run a loop
@@ -509,6 +545,11 @@ static const float kCenterDepthExpansionRatio = 1.4;
         SCAssimilatedFrameMetadata metadata = SCAssimilatedFrameMetadataFromPBFAssimilatedFrameMetadata(pbfMetadata,
                                                                                                         _inputQueue_statistics.consecutiveLostTrackingCount);
         
+        const NSUInteger frameEpoch = incomingFrameData.captureEpoch;
+        if (frameEpoch == self.captureEpoch && (metadata.result == SCAssimilatedFrameResultSucceeded || metadata.result == SCAssimilatedFrameResultPoorTracking)) {
+            [self _modelQueue_publishPointCloud];
+        }
+
         if (_includesDepthBuffersInMetadata) {
             metadata.depthBuffer = CVPixelBufferRetain(incomingFrameData.depthBuffer);
         }
@@ -539,13 +580,17 @@ static const float kCenterDepthExpansionRatio = 1.4;
             statistics = _inputQueue_statistics;
         });
         
+        const SCReconstructionManagerStatistics frameStatistics = statistics;
         dispatch_async(dispatch_get_main_queue(), ^{
 #ifndef XCODE_ACTION_install // Avoid logging in archive builds
             printf("STATS: succeeded: %zd, lost tracking: %zd, consecutive lost tracking: %zd\n",
-                   statistics.succeededCount, statistics.lostTrackingCount, statistics.consecutiveLostTrackingCount);
+                   frameStatistics.succeededCount, frameStatistics.lostTrackingCount, frameStatistics.consecutiveLostTrackingCount);
 #endif
             
-            [_delegate reconstructionManager:self didProcessWithMetadata:metadata statistics:statistics];
+            // Reset/restart may happen while this callback waits on main.
+            if (frameEpoch == self.captureEpoch) {
+                [_delegate reconstructionManager:self didProcessWithMetadata:metadata statistics:frameStatistics];
+            }
             
             if (metadata.depthBuffer != NULL) {
                 CVPixelBufferRelease(metadata.depthBuffer);
@@ -592,9 +637,12 @@ static const float kCenterDepthExpansionRatio = 1.4;
 {
     const size_t depthWidth = CVPixelBufferGetWidth(data.depthBuffer);
     const size_t depthHeight = CVPixelBufferGetHeight(data.depthBuffer);
+    _latestCameraCalibrationData = data.calibrationData;
+    _latestCameraCalibrationFrameWidth = depthWidth;
+    _latestCameraCalibrationFrameHeight = depthHeight;
     
     // Build up the raw frame
-    sc3d::PerspectiveCamera camera = PerspectiveCameraFromAVCameraCalibrationData(data.calibrationData, depthWidth, depthHeight);
+    sc3d::PerspectiveCamera camera = PerspectiveCameraFromAVCameraCalibrationData(data.calibrationData, depthWidth, depthHeight, _cameraFocalLengthScaleFactor);
     
     if (!_wroteIntrinsicsToFile) {
         [self _writeIntrinsics:camera toFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"intrinsics.json"]];
@@ -608,6 +656,9 @@ static const float kCenterDepthExpansionRatio = 1.4;
         if (_modelQueue_frame != nullptr) { delete _modelQueue_frame; }
         
         _modelQueue_frame = new ProcessedFrame(camera, depthWidth, depthHeight);
+    } else {
+        // Focus/calibration can change without changing buffer dimensions.
+        _modelQueue_frame->rawFrame.camera = camera;
     }
     
     [[self class] _fillDepthVector:_modelQueue_frame->rawFrame.depths
@@ -660,7 +711,8 @@ static const float kCenterDepthExpansionRatio = 1.4;
     const size_t width = CVPixelBufferGetWidth(buffer);
     const size_t height = CVPixelBufferGetHeight(buffer);
     const size_t pixelCount = width * height;
-    const float *bufferValues = (const float *)CVPixelBufferGetBaseAddress(buffer);
+    const uint8_t *bufferValues = (const uint8_t *)CVPixelBufferGetBaseAddress(buffer);
+    const size_t bytesPerRow = CVPixelBufferGetBytesPerRow(buffer);
     
     assert(pixelCount == vectorOut.size());
     vectorOut.resize(pixelCount);
@@ -672,9 +724,9 @@ static const float kCenterDepthExpansionRatio = 1.4;
         float depth;
         
         if (flipsInputHorizontally) {
-            depth = bufferValues[(height - 1 - y) * width + x];
+            depth = ((const float *)(bufferValues + (height - 1 - y) * bytesPerRow))[x];
         } else {
-            depth = bufferValues[i];
+            depth = ((const float *)(bufferValues + y * bytesPerRow))[x];
         }
         
         vectorOut[i] = isnan(depth) ? nanReplacement : depth;
@@ -697,7 +749,8 @@ static const float kCenterDepthExpansionRatio = 1.4;
     const size_t depthWidth = CVPixelBufferGetWidth(depthBuffer);
     const size_t depthHeight = CVPixelBufferGetHeight(depthBuffer);
     const size_t depthPixelCount = depthWidth * depthHeight;
-    const float *depthBufferValues = (const float *)CVPixelBufferGetBaseAddress(depthBuffer);
+    const uint8_t *depthBufferValues = (const uint8_t *)CVPixelBufferGetBaseAddress(depthBuffer);
+    const size_t depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthBuffer);
     
     const size_t colorWidth = CVPixelBufferGetWidth(colorBuffer);
     const size_t colorHeight = CVPixelBufferGetHeight(colorBuffer);
@@ -738,9 +791,9 @@ static const float kCenterDepthExpansionRatio = 1.4;
             
             float depth;
             if (flipsInputHorizontally) {
-                depth = depthBufferValues[(depthHeight - 1 - y) * depthWidth + x];
+                depth = ((const float *)(depthBufferValues + (depthHeight - 1 - y) * depthBytesPerRow))[x];
             } else {
-                depth = depthBufferValues[y * depthWidth + x];
+                depth = ((const float *)(depthBufferValues + y * depthBytesPerRow))[x];
             }
             
             if (normalizedClipRegion.size.width > 0 && normalizedClipRegion.size.height > 0) {

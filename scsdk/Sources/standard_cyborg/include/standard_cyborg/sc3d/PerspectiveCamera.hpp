@@ -95,6 +95,12 @@ public:
     /** Get the optical center from the intrinsic matrix */
     math::Vec2 getOpticalImageCenter() const;
     
+    /** Distortion center is independent from the intrinsic principal point.
+      * Legacy cameras without this metadata retain their previous optical-center behavior. */
+    void setLensDistortionCenter(math::Vec2 center);
+    math::Vec2 getLensDistortionCenter() const;
+    float getLensDistortionMaxRadius() const;
+
     /** Get the maximum distance from the optical center to the corner of the frame */
     float getOpticalImageMaxRadius() const;
 
@@ -237,6 +243,8 @@ private:
     std::string frame;
 
     float focalLengthScaleFactor = 1.0;
+    bool hasLensDistortionCenter = false;
+    math::Vec2 lensDistortionCenter;
     
     math::Vec2 intrinsicMatrixReferenceSize;
     

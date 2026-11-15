@@ -35,9 +35,10 @@ let package = Package(
             // into /usr/local/include for this Swift package target.
             exclude: ["StandardCyborgFusion/Models"],
             publicHeadersPath: "include",
+            // Sensor depth uses NaN for missing observations. Preserve IEEE finite checks.
             cxxSettings: [
                 // Always optimize, even for debug builds, in order to be usable while debugging the rest of an app
-                .unsafeFlags(["-fobjc-arc", "-Os", "-fno-math-errno", "-ffast-math"]),
+                .unsafeFlags(["-fobjc-arc", "-Os", "-fno-math-errno"]),
                 .headerSearchPath("."),
                 .headerSearchPath("../libigl/include"),
                 .headerSearchPath("StandardCyborgFusion/Algorithm"),
@@ -57,6 +58,7 @@ let package = Package(
             resources: [
                 .copy("StandardCyborgFusionTests/Data")
             ],
+            // Sensor depth uses NaN for missing observations. Preserve IEEE finite checks.
             cxxSettings: [
                 .define("DEBUG", .when(configuration: .debug)),
                 .define("PROJECT_DIR", to: "\".\""),

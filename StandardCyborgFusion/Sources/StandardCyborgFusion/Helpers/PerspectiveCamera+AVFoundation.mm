@@ -18,18 +18,18 @@
 
 using namespace standard_cyborg;
 
-sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCalibrationData *calibrationData, size_t pixelsWide, size_t pixelsHigh)
+sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCalibrationData *calibrationData, size_t pixelsWide, size_t pixelsHigh, float focalLengthScaleFactor)
 {
     NSData *lensDistortionLookupTableData = calibrationData.lensDistortionLookupTable;
     NSData *inverseLensDistortionLookupTableData = calibrationData.inverseLensDistortionLookupTable;
     
     std::vector<float> lensDistortionTable {};
     const float* tableData = (float*)[lensDistortionLookupTableData bytes];
-    lensDistortionTable.assign(tableData, tableData + [lensDistortionLookupTableData length] / sizeof(float));
+    if (tableData != nullptr) { lensDistortionTable.assign(tableData, tableData + [lensDistortionLookupTableData length] / sizeof(float)); }
 
     std::vector<float> inverseLensDistortionTable {};
     const float* inverseTableData = (float*)[inverseLensDistortionLookupTableData bytes];
-    inverseLensDistortionTable.assign(inverseTableData, inverseTableData + [inverseLensDistortionLookupTableData length] / sizeof(float));
+    if (inverseTableData != nullptr) { inverseLensDistortionTable.assign(inverseTableData, inverseTableData + [inverseLensDistortionLookupTableData length] / sizeof(float)); }
 
     sc3d::PerspectiveCamera camera;
 
@@ -37,7 +37,8 @@ sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCal
     // loop closure. There's a fair bit of scatter in the data, so this is certainly not "correct",
     // merely "much, much better than nothing." For more details, see:
     //    https://github.com/StandardCyborg/ScanAnalysis/tree/master/ScanAnalysis/2019-05-09-dimensional-accuracy-calibration
-    camera.setFocalLengthScaleFactor(1.019f);
+    // Preserve the SDK default; metric callers opt into the supplied calibrated intrinsics.
+    camera.setFocalLengthScaleFactor(focalLengthScaleFactor);
 
     math::Mat3x4 extrinsicMatrix(toMat3x4(calibrationData.extrinsicMatrix));
     camera.setExtrinsicMatrix(extrinsicMatrix);
@@ -65,6 +66,7 @@ sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCal
     camera.setNominalIntrinsicMatrix(toMat3x3(calibrationData.intrinsicMatrix));
     camera.setIntrinsicMatrixReferenceSize(math::Vec2(calibrationData.intrinsicMatrixReferenceDimensions.width,
                                                            calibrationData.intrinsicMatrixReferenceDimensions.height));
+    camera.setLensDistortionCenter(math::Vec2(calibrationData.lensDistortionCenter.x, calibrationData.lensDistortionCenter.y));
     camera.setLensDistortionLookupTable(lensDistortionTable);
     camera.setInverseLensDistortionLookupTable(inverseLensDistortionTable);
     camera.setLegacyImageSize({(int)pixelsWide, (int)pixelsHigh});

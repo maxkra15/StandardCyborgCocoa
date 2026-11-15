@@ -28,8 +28,8 @@ struct ComputePointsKernelUniforms {
     void setPerspectiveCamera(const sc3d::PerspectiveCamera& camera, size_t width, size_t height)
     {
         opticalImageSize = toSimdFloat2(camera.getIntrinsicMatrixReferenceSize());
-        opticalImageCenter = toSimdFloat2(camera.getOpticalImageCenter());
-        maxLensCalibrationRadius = camera.getOpticalImageMaxRadius();
+        opticalImageCenter = toSimdFloat2(camera.getLensDistortionCenter());
+        maxLensCalibrationRadius = camera.getLensDistortionMaxRadius();
         lensDistortionConstants = toSimdFloat4(camera.getLensDistortionCurveFit());
         viewMatrixInverse = toSimdFloat4x4(camera.getViewMatrixInverse());
         intrinsicMatrixInv = toSimdFloat3x3(camera.getIntrinsicMatrixInverse());

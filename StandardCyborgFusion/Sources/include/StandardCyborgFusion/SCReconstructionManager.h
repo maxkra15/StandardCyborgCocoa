@@ -59,6 +59,9 @@ typedef struct {
 /** When non-empty, clips the reconstruction region of incoming depth buffers and frames to this position and size, each normalized from [0..1] */
 @property (nonatomic) CGRect normalizedFrameClipRegion;
 
+/** Set before submitting frames. SDK legacy default is 1.019; calibrated metric capture uses 1.0. */
+@property (nonatomic) float cameraFocalLengthScaleFactor;
+
 /** The camera calibration data used by the most recently passed depth frame. */
 @property (nonatomic, readonly) AVCameraCalibrationData *latestCameraCalibrationData;
 @property (nonatomic, readonly) NSInteger latestCameraCalibrationFrameWidth;
