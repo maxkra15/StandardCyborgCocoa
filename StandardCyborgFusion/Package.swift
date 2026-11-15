@@ -34,6 +34,7 @@ let package = Package(
             // Exclude their models to avoid Xcode 27 installing generated headers
             // into /usr/local/include for this Swift package target.
             exclude: ["StandardCyborgFusion/Models"],
+            resources: [.process("Resources")],
             publicHeadersPath: "include",
             // Sensor depth uses NaN for missing observations. Preserve IEEE finite checks.
             cxxSettings: [

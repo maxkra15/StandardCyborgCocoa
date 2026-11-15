@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		E19E11000000000000000001 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E19E11000000000000000002 /* PrivacyInfo.xcprivacy */; };
 		7620D24C21CDACEA008D0095 /* StandardCyborgUI.h in Headers */ = {isa = PBXBuildFile; fileRef = 7620D24A21CDACEA008D0095 /* StandardCyborgUI.h */; settings = {ATTRIBUTES = (Public, ); }; };
 		7620D25321CDAD40008D0095 /* CameraManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25221CDAD40008D0095 /* CameraManager.swift */; };
 		7620D25B21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25A21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift */; };
@@ -33,6 +34,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		E19E11000000000000000002 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = Resources/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		7620D24721CDACEA008D0095 /* StandardCyborgUI.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = StandardCyborgUI.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		7620D24A21CDACEA008D0095 /* StandardCyborgUI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = StandardCyborgUI.h; sourceTree = "<group>"; };
 		7620D24B21CDACEA008D0095 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -95,6 +97,7 @@
 			isa = PBXGroup;
 			children = (
 				7620D24B21CDACEA008D0095 /* Info.plist */,
+				E19E11000000000000000002 /* PrivacyInfo.xcprivacy */,
 				7642B82E21E6BA6C00BC45C7 /* Assets.xcassets */,
 				7620D24A21CDACEA008D0095 /* StandardCyborgUI.h */,
 				7642B7D021E4558200BC45C7 /* ScanningViewController.swift */,
@@ -205,6 +208,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				7642B82F21E6BA6C00BC45C7 /* Assets.xcassets in Resources */,
+				E19E11000000000000000001 /* PrivacyInfo.xcprivacy in Resources */,
 				762D925E2A25AE7700399490 /* ScenePreviewViewController.scn in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
