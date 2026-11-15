@@ -88,12 +88,12 @@ import UIKit
     
     @objc public func shutterTapped(_ sender: UIButton?) {
         guard
-            presentedViewController == nil,
-            _cameraManager.isSessionRunning
+            presentedViewController == nil
             else { return }
         
         switch _state {
         case .default:
+            guard _cameraManager.isSessionRunning else { return }
             _startCountdown { self.startScanning() }
         case .countdownSeconds(let seconds):
             if seconds > 0 {
@@ -109,15 +109,16 @@ import UIKit
     /** Starts scanning immediately */
     @objc public func startScanning() {
         guard !_isCompletingCapture else { return }
-        if minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
+        if !recordsScanDiagnostics && minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
             _state = .default
             delegate?.scanningViewController?(self, captureGuidance: _depthGuidance?.message ?? "Aim at the whole foot and wait for depth detail.")
             return
         }
         _captureLifetime.invalidate()
         _captureState.begin()
-        _diagnostics = recordsScanDiagnostics ? ScanDiagnosticsRecorder() : nil
-        if usesDeviceMotionGravity {
+        _prepareDiagnosticsIfNeeded()
+        _diagnostics?.beginCapture()
+        if usesDeviceMotionGravity && !recordsScanDiagnostics {
             guard _motionManager.isDeviceMotionAvailable, _motionManager.deviceMotion != nil else {
                 _failCapture("Motion sensing is not ready. Hold the phone still for a moment, then try again.")
                 return
@@ -141,6 +142,11 @@ import UIKit
 
     /** Stops scanning immediately */
     @objc public func stopScanning(reason: ScanningTerminationReason) {
+        if _diagnostics != nil {
+            _stopDiagnosticCapture(reason: reason == .finished ? "Stopped by recording button" : "Capture canceled",
+                                   incomplete: reason == .canceled)
+            return
+        }
         if reason == .canceled { _captureLifetime.invalidate() }
         guard _state == _State.scanning else { return }
         
@@ -236,7 +242,7 @@ import UIKit
     }
     
     @objc public var generatesTexturedMeshes: Bool = false {
-        didSet { _reconstructionManager.includesColorBuffersInMetadata = generatesTexturedMeshes }
+        didSet { if isViewLoaded { _reconstructionManager.includesColorBuffersInMetadata = generatesTexturedMeshes } }
     }
     @objc public var texturedMeshColorBufferSaveInterval: Int = 8
     @objc public lazy var meshTexturing = SCMeshTexturing()
@@ -246,6 +252,7 @@ import UIKit
     
     override open func viewDidLoad() {
         super.viewDidLoad()
+        _prepareDiagnosticsIfNeeded()
     
         _setUpSubviews()
         
@@ -253,6 +260,7 @@ import UIKit
         _cameraManager.configureCaptureSession(maxResolution: maxDepthResolution)
         
         _reconstructionManager.delegate = self
+        _reconstructionManager.includesColorBuffersInMetadata = generatesTexturedMeshes
         _reconstructionManager.cameraFocalLengthScaleFactor = cameraFocalLengthScaleFactor
         if reconstructionIterationLimit > 0 { _reconstructionManager.maxICPIterations = reconstructionIterationLimit }
         if maximumReconstructionDepth > 0 {
@@ -346,13 +354,32 @@ import UIKit
     // MARK: - CameraManagerDelegate
     
     public func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData) {
+        cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData,
+                        colorTimestamp: .invalid, depthTimestamp: .invalid)
+    }
+
+    public func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime,
+                              depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool) {
+        var recorder: ScanDiagnosticsRecorder?
+        DispatchQueue.main.sync { if self._state == .scanning { recorder = self._diagnostics } }
+        recorder?.recordCameraDrop(colorTimestamp: colorTimestamp, depthTimestamp: depthTimestamp,
+                                   colorDropped: colorDropped, depthDropped: depthDropped)
+    }
+
+    public func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer,
+                               depthCalibrationData: AVCameraCalibrationData,
+                               colorTimestamp: CMTime, depthTimestamp: CMTime) {
         var isScanning = false
         var shouldAccumulate = false
         var generation: UInt = 0
         var viewMatrix = matrix_identity_float4x4
+        var recorder: ScanDiagnosticsRecorder?
+        var motion: CMDeviceMotion?
+        var withheldReason = "not_scanning"
         DispatchQueue.main.sync {
             isScanning = self._state == .scanning
             generation = self._captureLifetime.generation
+            if isScanning { recorder = self._diagnostics; motion = self._motionManager.deviceMotion }
             viewMatrix = self._latestViewMatrix
             let now = ProcessInfo.processInfo.systemUptime
             if self.minimumCaptureDistance > 0 {
@@ -362,7 +389,6 @@ import UIKit
             shouldAccumulate = isScanning
             if isScanning {
                 // Preserve raw evidence even when a depth frame is withheld from fusion.
-                self._diagnostics?.recordDepth(depthBuffer, calibration: depthCalibrationData)
                 if self.minimumCaptureDistance > 0 {
                     let wasRecovering = self._captureState.isRecovering
                     let usable = self._depthGuidance?.allowsStart == true
@@ -371,7 +397,7 @@ import UIKit
                     if !usable && !wasRecovering {
                         self.delegate?.scanningViewController?(self, trackingIsStable: false)
                     }
-                    if expired {
+                    if expired && !self.recordsScanDiagnostics {
                         self._failCapture("Depth detail did not recover. Keep the whole foot and some floor visible at about 30–40 cm, then try again.")
                         shouldAccumulate = false
                     }
@@ -387,7 +413,14 @@ import UIKit
                     shouldAccumulate = false
                 }
             }
+            withheldReason = shouldAccumulate ? "requested" : (isScanning ? "depth_or_motion_withheld" : "not_scanning")
         }
+
+        let diagnosticSequence = recorder?.recordFrame(color: colorBuffer, depth: depthBuffer,
+            calibration: depthCalibrationData, colorTimestamp: colorTimestamp, depthTimestamp: depthTimestamp,
+            motion: motion, submission: ["submitted": false, "requested": shouldAccumulate,
+                "reason": withheldReason, "captureGeneration": generation])
+        if recorder != nil && diagnosticSequence == nil { shouldAccumulate = false }
 
         let pointCloud: SCPointCloud
         
@@ -415,9 +448,14 @@ import UIKit
             DispatchQueue.main.sync {
                 guard self._state == .scanning, !self._isCompletingCapture,
                       self._captureLifetime.accepts(generation) else { return }
-                self._reconstructionManager.accumulate(depthBuffer: depthBuffer,
-                                                       colorBuffer: colorBuffer,
-                                                       calibrationData: depthCalibrationData)
+                if let recorder, let diagnosticSequence {
+                    recorder.recordEvent("fusion_submitted", fields: ["inputSequence": diagnosticSequence])
+                    self._reconstructionManager.accumulate(depthBuffer: depthBuffer, colorBuffer: colorBuffer,
+                        calibrationData: depthCalibrationData, diagnosticSequence: diagnosticSequence)
+                } else {
+                    self._reconstructionManager.accumulate(depthBuffer: depthBuffer, colorBuffer: colorBuffer,
+                        calibrationData: depthCalibrationData)
+                }
             }
         }
     }
@@ -481,7 +519,9 @@ import UIKit
                 if _captureState.shouldStopForTrackingLoss(
                     now: ProcessInfo.processInfo.systemUptime, grace: trackingRecoveryTime
                 ) {
-                    _failCapture("Tracking was lost. Return to the last angle, move more slowly and keep the foot still. Start with the whole foot and some floor visible.")
+                    if !recordsScanDiagnostics {
+                        _failCapture("Tracking was lost. Return to the last angle, move more slowly and keep the foot still. Start with the whole foot and some floor visible.")
+                    }
                 }
             } else if metadata.result == .failed {
                 let assimilatedTooFewFrames = statistics.succeededCount < _failedScanShowPreviewMinFrameCount
@@ -495,11 +535,15 @@ import UIKit
     
     public func reconstructionManager(_ manager: SCReconstructionManager, didEncounterAPIError error: Error) {
         print("SCReconstructionManager hit API error: \(error)")
+        if let recorder = _diagnostics {
+            recorder.recordEvent("fusion_api_error", fields: ["message": error.localizedDescription])
+            return
+        }
         _failCapture("The depth camera was interrupted. Close the scanner and try again.")
     }
 
     public func cameraManager(_ manager: CameraManager, didInterrupt message: String) {
-        if _state == .scanning { _failCapture(message) }
+        if _state == .scanning || _diagnostics != nil { _failCapture(message) }
     }
 
     private func _publishCaptureProgress() {
@@ -508,11 +552,45 @@ import UIKit
         onCaptureProgress?(_captureState.progress(guidance: guidance))
     }
 
+    private func _prepareDiagnosticsIfNeeded() {
+        guard recordsScanDiagnostics, _diagnostics == nil else { return }
+        let recorder = ScanDiagnosticsRecorder(configuration: [
+            "maximumDepthMetres": maximumReconstructionDepth, "icpIterationLimit": reconstructionIterationLimit,
+            "focalLengthScaleFactor": cameraFocalLengthScaleFactor, "minimumCaptureDistance": minimumCaptureDistance,
+            "maximumCaptureDistance": maximumCaptureDistance, "usesDeviceMotionGravity": usesDeviceMotionGravity,
+            "maxDepthResolution": maxDepthResolution, "trackingRecoveryTime": trackingRecoveryTime,
+            "flipsInputHorizontally": mirrorModeEnabled, "normalizedFrameClipRegion": [0,0,0,0]
+        ]) { [weak self] message in self?._failCapture(message) }
+        _diagnostics = recorder
+        _reconstructionManager.diagnosticEventHandler = { [weak recorder] event in
+            guard let kind = event["event"] as? String else { return }
+            recorder?.recordEvent(kind, fields: event as? [String: Any] ?? [:])
+        }
+    }
+
+    private func _stopDiagnosticCapture(reason: String, incomplete: Bool) {
+        guard !_isCompletingCapture, let recorder = _diagnostics else { return }
+        _isCompletingCapture = true
+        _captureLifetime.invalidate()
+        _state = .default
+        _cameraManager.stopSession { [self] in
+            // Session stop drains camera callbacks. Seal the captured RGBD prefix
+            // even if fusion is still busy, tracking failed or no points exist.
+            _reconstructionManager.reset()
+            recorder.finish(reason: reason, gravity: _captureState.gravity, incomplete: incomplete) { [self] url in
+                _diagnostics = nil
+                _reconstructionManager.diagnosticEventHandler = nil
+                if let url { delegate?.scanningViewController?(self, didWriteDiagnostics: url) }
+                else { delegate?.scanningViewController?(self, didFail: "The private recording could not be saved.") }
+            }
+        }
+    }
+
     private func _finishDiagnostics(_ cloud: SCPointCloud, reason: String, completion: @escaping () -> Void) {
         guard let recorder = _diagnostics else { completion(); return }
         _diagnostics = nil
         let diagnosticGeneration = _captureLifetime.generation
-        recorder.write(cloud: cloud, reason: reason, maximumDepth: maximumReconstructionDepth, iterationLimit: Int(_reconstructionManager.maxICPIterations), focalLengthScaleFactor: cameraFocalLengthScaleFactor) { url in
+        recorder.finish(reason: reason, gravity: cloud.gravity) { url in
             if self._captureLifetime.accepts(diagnosticGeneration), let url = url {
                 self.delegate?.scanningViewController?(self, didWriteDiagnostics: url)
             }
@@ -521,6 +599,10 @@ import UIKit
     }
 
     private func _failCapture(_ message: String) {
+        if _diagnostics != nil {
+            _stopDiagnosticCapture(reason: message, incomplete: true)
+            return
+        }
         guard !_isCompletingCapture else { return }
         guard _diagnostics != nil else {
             stopScanning(reason: .canceled)
@@ -669,6 +751,7 @@ import UIKit
                 break
             case .configurationFailed:
                 print("Configuration failed for an unknown reason")
+                if self._diagnostics != nil { self._stopDiagnosticCapture(reason: "Camera configuration failed before capture", incomplete: true) }
             case .notAuthorized:
                 let message = "To take a 3D scan, go to your privacy settings. Tap Camera and turn on for Capture"
                 let alertController = UIAlertController(title: "Camera Access", message: message, preferredStyle: .alert)

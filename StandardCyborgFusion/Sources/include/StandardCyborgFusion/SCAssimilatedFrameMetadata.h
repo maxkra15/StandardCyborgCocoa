@@ -20,6 +20,8 @@ typedef NS_ENUM(NSInteger, SCAssimilatedFrameResult) {
 };
 
 typedef struct {
+    /** Caller diagnostic input ID; -1 for callers using the legacy API. */
+    NSInteger inputSequence;
     SCAssimilatedFrameResult result;
     matrix_float4x4 viewMatrix;
     matrix_float4x4 projectionMatrix;

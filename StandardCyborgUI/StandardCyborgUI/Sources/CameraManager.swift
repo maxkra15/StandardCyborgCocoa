@@ -12,6 +12,8 @@ import UIKit
 
 @objc public protocol CameraManagerDelegate: AnyObject {
     func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData)
+    @objc optional func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData, colorTimestamp: CMTime, depthTimestamp: CMTime)
+    @objc optional func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime, depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool)
     @objc optional func cameraManager(_ manager: CameraManager, didInterrupt message: String)
     @objc optional func cameraManagerDidStartSession(_ manager: CameraManager)
     @objc optional func cameraManagerDidNotStartSession(_ manager: CameraManager, result: CameraManager.SessionSetupResult)
@@ -142,7 +144,8 @@ public extension Notification.Name {
                 self._sessionQueue_isSessionRunning = self._captureSession.isRunning
             }
             
-            DispatchQueue.main.async { completion?() }
+            // Drain synchronized callbacks before a diagnostic journal is sealed.
+            self._dataOutputQueue.async { DispatchQueue.main.async { completion?() } }
         }
     }
     
@@ -318,21 +321,34 @@ public extension Notification.Name {
                     synchronizedDataCollection.synchronizedData(for: _depthDataOutput) as? AVCaptureSynchronizedDepthData,
             let syncedVideoData: AVCaptureSynchronizedSampleBufferData =
                     synchronizedDataCollection.synchronizedData(for: _videoDataOutput) as? AVCaptureSynchronizedSampleBufferData
-        else { return /* Only work on synced pairs */ }
+        else {
+            delegate?.cameraManager?(self, didDropColorAt: .invalid, depthAt: .invalid, colorDropped: true, depthDropped: true)
+            return /* Only work on synced pairs; retain an explicit gap in diagnostics. */
+        }
         
-        guard !syncedDepthData.depthDataWasDropped &&
-              !syncedVideoData.sampleBufferWasDropped
-        else { return }
+        guard !syncedDepthData.depthDataWasDropped && !syncedVideoData.sampleBufferWasDropped else {
+            delegate?.cameraManager?(self, didDropColorAt: syncedVideoData.timestamp, depthAt: syncedDepthData.timestamp,
+                colorDropped: syncedVideoData.sampleBufferWasDropped, depthDropped: syncedDepthData.depthDataWasDropped)
+            return
+        }
         
         // The fusion code consumes metric Float32, never disparity or Float16.
         let depthData = syncedDepthData.depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
         let depthBuffer = depthData.depthDataMap
         let sampleBuffer = syncedVideoData.sampleBuffer
         guard let colorBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
-              let depthCalibrationData = depthData.cameraCalibrationData
-        else { return }
+              let depthCalibrationData = depthData.cameraCalibrationData else {
+            delegate?.cameraManager?(self, didDropColorAt: syncedVideoData.timestamp, depthAt: syncedDepthData.timestamp,
+                colorDropped: CMSampleBufferGetImageBuffer(sampleBuffer) == nil,
+                depthDropped: depthData.cameraCalibrationData == nil)
+            return
+        }
         
-        delegate?.cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData)
+        if delegate?.cameraDidOutput?(colorBuffer: colorBuffer, depthBuffer: depthBuffer,
+            depthCalibrationData: depthCalibrationData, colorTimestamp: syncedVideoData.timestamp,
+            depthTimestamp: syncedDepthData.timestamp) == nil {
+            delegate?.cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData)
+        }
     }
     
     // MARK: - Private

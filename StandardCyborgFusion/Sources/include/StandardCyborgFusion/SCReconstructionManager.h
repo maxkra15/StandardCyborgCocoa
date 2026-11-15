@@ -62,6 +62,10 @@ typedef struct {
 /** Set before submitting frames. SDK legacy default is 1.019; calibrated metric capture uses 1.0. */
 @property (nonatomic) float cameraFocalLengthScaleFactor;
 
+/** Opt-in input/admission journal. Called from internal serial queues; the
+ receiver must enqueue bounded IO and must not call back into reconstruction. */
+@property (atomic, copy, nullable) void (^diagnosticEventHandler)(NSDictionary *event);
+
 /** The camera calibration data used by the most recently passed depth frame. */
 @property (nonatomic, readonly) AVCameraCalibrationData *latestCameraCalibrationData;
 @property (nonatomic, readonly) NSInteger latestCameraCalibrationFrameWidth;
@@ -85,6 +89,12 @@ typedef struct {
                   colorBuffer:(CVPixelBufferRef)colorBuffer
               calibrationData:(AVCameraCalibrationData *)calibrationData
 NS_SWIFT_NAME(accumulate(depthBuffer:colorBuffer:calibrationData:));
+
+- (void)accumulateDepthBuffer:(CVPixelBufferRef)depthBuffer
+                  colorBuffer:(CVPixelBufferRef)colorBuffer
+              calibrationData:(AVCameraCalibrationData *)calibrationData
+           diagnosticSequence:(NSInteger)diagnosticSequence
+NS_SWIFT_NAME(accumulate(depthBuffer:colorBuffer:calibrationData:diagnosticSequence:));
 
 /** Pass in device motion updates as fast as they are made available by the system */
 - (void)accumulateDeviceMotion:(CMDeviceMotion *)deviceMotion;

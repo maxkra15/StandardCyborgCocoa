@@ -18,6 +18,7 @@ SCAssimilatedFrameMetadataFromPBFAssimilatedFrameMetadata(PBFAssimilatedFrameMet
     static const NSInteger kMaxConsecutiveFailedFrameCount = 8;
     
     SCAssimilatedFrameMetadata metadata;
+    metadata.inputSequence = -1;
     metadata.viewMatrix = toSimdFloat4x4(pbfMetadata.viewMatrix);
 
     metadata.projectionMatrix = toSimdFloat4x4(pbfMetadata.projectionMatrix);

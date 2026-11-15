@@ -41,6 +41,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface _IncomingFrameData : NSObject
 @property (nonatomic, readonly) int sequence;
 @property (nonatomic, readonly) NSUInteger captureEpoch;
+@property (nonatomic) NSInteger diagnosticSequence;
 @property (nonatomic, readonly) CVPixelBufferRef depthBuffer;
 @property (nonatomic, readonly) CVPixelBufferRef colorBuffer;
 @property (nonatomic, readonly) AVCameraCalibrationData *calibrationData;
@@ -388,6 +389,25 @@ NS_ASSUME_NONNULL_BEGIN
                   colorBuffer:(CVPixelBufferRef)colorBuffer
               calibrationData:(AVCameraCalibrationData *)calibrationData
 {
+    [self accumulateDepthBuffer:depthBuffer colorBuffer:colorBuffer calibrationData:calibrationData diagnosticSequence:-1];
+}
+
+- (void)_recordDiagnostic:(NSString *)event sequence:(NSInteger)sequence fields:(NSDictionary *)fields
+{
+    void (^handler)(NSDictionary *) = self.diagnosticEventHandler;
+    if (handler == nil) { return; }
+    NSMutableDictionary *record = [fields mutableCopy];
+    record[@"event"] = event;
+    record[@"inputSequence"] = @(sequence);
+    record[@"hostTimeSeconds"] = @([NSProcessInfo processInfo].systemUptime);
+    handler(record);
+}
+
+- (void)accumulateDepthBuffer:(CVPixelBufferRef)depthBuffer
+                  colorBuffer:(CVPixelBufferRef)colorBuffer
+              calibrationData:(AVCameraCalibrationData *)calibrationData
+           diagnosticSequence:(NSInteger)diagnosticSequence
+{
     if (depthBuffer == NULL || colorBuffer == NULL || calibrationData == nil) { return; }
     CVPixelBufferRetain(depthBuffer);
     CVPixelBufferRetain(colorBuffer);
@@ -396,6 +416,7 @@ NS_ASSUME_NONNULL_BEGIN
         // Reset is queued behind the continuous model loop. Do not restart that
         // loop with new frames until its old model has actually been discarded.
         if (_inputQueue_resetPending) {
+            [self _recordDiagnostic:@"fusion_drop" sequence:diagnosticSequence fields:@{@"reason": @"reset_pending"}];
             CVPixelBufferRelease(depthBuffer);
             CVPixelBufferRelease(colorBuffer);
             return;
@@ -408,11 +429,16 @@ NS_ASSUME_NONNULL_BEGIN
                                                                     depthBuffer:depthBuffer
                                                                     colorBuffer:colorBuffer
                                                                 calibrationData:calibrationData];
+        data.diagnosticSequence = diagnosticSequence;
         CVPixelBufferRelease(depthBuffer);
         CVPixelBufferRelease(colorBuffer);
         
         // We only use the most recent raw frame, dropping any other ones that haven't had a chance to process
         BOOL dropped = _inputQueue_incomingFrameData != nil;
+        if (dropped) {
+            [self _recordDiagnostic:@"fusion_drop" sequence:_inputQueue_incomingFrameData.diagnosticSequence fields:@{@"reason": @"queue_overwritten"}];
+        }
+        [self _recordDiagnostic:@"fusion_admitted" sequence:diagnosticSequence fields:@{@"nativeSequence": @(sequence), @"captureEpoch": @(self.captureEpoch)}];
         _inputQueue_incomingFrameData = data;
         
         if (!dropped) {
@@ -443,6 +469,9 @@ NS_ASSUME_NONNULL_BEGIN
         _inputQueue_stopped = YES;
         
         BOOL dropped = _inputQueue_incomingFrameData != nil;
+        if (dropped) {
+            [self _recordDiagnostic:@"fusion_drop" sequence:_inputQueue_incomingFrameData.diagnosticSequence fields:@{@"reason": @"finalize_pending"}];
+        }
         _inputQueue_incomingFrameData = nil;
         
         if (!dropped) {
@@ -479,6 +508,9 @@ NS_ASSUME_NONNULL_BEGIN
     dispatch_sync(_inputQueue, ^{
         self.captureEpoch += 1;
         _inputQueue_resetPending = YES;
+        if (_inputQueue_incomingFrameData != nil) {
+            [self _recordDiagnostic:@"fusion_drop" sequence:_inputQueue_incomingFrameData.diagnosticSequence fields:@{@"reason": @"reset"}];
+        }
         _inputQueue_incomingFrameData = nil;
         _inputQueue_incomingFrameSequence = 0;
         _inputQueue_statistics = SCReconstructionManagerStatistics();
@@ -544,6 +576,10 @@ static const float kCenterDepthExpansionRatio = 1.4;
         
         SCAssimilatedFrameMetadata metadata = SCAssimilatedFrameMetadataFromPBFAssimilatedFrameMetadata(pbfMetadata,
                                                                                                         _inputQueue_statistics.consecutiveLostTrackingCount);
+        metadata.inputSequence = incomingFrameData.diagnosticSequence;
+        [self _recordDiagnostic:@"fusion_processed" sequence:metadata.inputSequence fields:@{
+            @"result": @(metadata.result), @"assimilationTime": @(metadata.assimilationTime),
+            @"icpIterationCount": @(metadata.icpIterationCount)}];
         
         const NSUInteger frameEpoch = incomingFrameData.captureEpoch;
         if (frameEpoch == self.captureEpoch && (metadata.result == SCAssimilatedFrameResultSucceeded || metadata.result == SCAssimilatedFrameResultPoorTracking)) {
@@ -573,6 +609,9 @@ static const float kCenterDepthExpansionRatio = 1.4;
                     
                 case SCAssimilatedFrameResultFailed:
                     _inputQueue_stopped = YES;
+                    if (_inputQueue_incomingFrameData != nil) {
+                        [self _recordDiagnostic:@"fusion_drop" sequence:_inputQueue_incomingFrameData.diagnosticSequence fields:@{@"reason": @"tracking_failed"}];
+                    }
                     _inputQueue_incomingFrameData = nil;
                     break;
             }
@@ -620,6 +659,14 @@ static const float kCenterDepthExpansionRatio = 1.4;
     [self _modelQueue_unprojectRawFrameIntoFrame];
     
     [self _modelQueue_configureModelForRawFrame];
+
+    [self _recordDiagnostic:@"fusion_processing" sequence:data.diagnosticSequence fields:@{
+        @"assimilationStartTime": @(startTime), @"nativeSequence": @(data.sequence),
+        @"captureEpoch": @(data.captureEpoch), @"icpDownsampleFraction": @(_pbfConfig.icpDownsampleFraction),
+        @"maxDepth": @(_surfelFusionConfig.maxDepth), @"minDepth": @(_surfelFusionConfig.minDepth),
+        @"icpMaxIterations": @(_icpConfig.maxIterations), @"icpTolerance": @(_icpConfig.tolerance),
+        @"icpOutlierDeviationsThreshold": @(_icpConfig.outlierDeviationsThreshold),
+        @"threadCount": @(_icpConfig.threadCount)}];
     
     auto metadata = _modelQueue_model->assimilate(*_modelQueue_frame, _pbfConfig, _icpConfig, _surfelFusionConfig, startTime);
     
