@@ -53,6 +53,9 @@ import UIKit
     private var isReplayOnlyCapture: Bool { recordsScanDiagnostics && !reconstructsRecordedScan }
     public var reconstructionIterationLimit: Int32 = 0
     public var minimumCaptureDistance: Float = 0
+    /// A separate lower bound for tracking after capture starts. Zero uses
+    /// the same distance for both starting and tracking.
+    public var minimumTrackingDistance: Float = 0
     public var maximumCaptureDistance: Float = 0.5
     private var _depthGuidance: ScanDepthGuidance?
     private var _lastDepthGuidanceTime: TimeInterval = 0
@@ -369,14 +372,19 @@ import UIKit
                 // Preserve raw evidence even when a depth frame is withheld from fusion.
                 if self.minimumCaptureDistance > 0 {
                     let wasRecovering = self._captureState.isRecovering
-                    let usable = self._depthGuidance?.allowsStart == true
+                    // Apply near-view tolerance after fusion has a working model.
+                    let hasTracked = self._captureState.acceptedFrameCount > 0
+                    let usable = hasTracked
+                        ? self._depthGuidance?.allowsTracking == true
+                        : self._depthGuidance?.allowsStart == true
                     let expired = self._captureState.updateDepthUsable(usable, now: now, grace: 8)
                     shouldAccumulate = usable
                     if !usable && !wasRecovering {
                         self.delegate?.scanningViewController?(self, trackingIsStable: false)
                     }
                     if expired && !self.isReplayOnlyCapture {
-                        self._failCapture("Depth detail did not recover. Keep the whole foot and some floor visible at about 30–40 cm, then try again.")
+                        let explanation = self._depthGuidance?.interruptionMessage ?? self._depthGuidance?.message
+                        self._failCapture(explanation ?? "Depth detail did not recover. Keep the whole foot and some floor visible, then try again.")
                         shouldAccumulate = false
                     }
                     self._publishCaptureProgress()
@@ -453,7 +461,8 @@ import UIKit
             let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float.self)
             for x in stride(from: width / 6, to: width * 5 / 6, by: 6) { samples.append(row[x]) }
         }
-        let guidance = ScanDepthGuidance(samples: samples, minimumDistance: minimumCaptureDistance, maximumDistance: maximumCaptureDistance)
+        let guidance = ScanDepthGuidance(samples: samples, minimumDistance: minimumCaptureDistance,
+            maximumDistance: maximumCaptureDistance, minimumTrackingDistance: minimumTrackingDistance)
         let now = ProcessInfo.processInfo.systemUptime
         if _lastReportedDepthMessage != guidance.message && now - _lastDepthMessageTime >= 0.25 {
             _lastReportedDepthMessage = guidance.message
@@ -538,6 +547,7 @@ import UIKit
         let recorder = ScanDiagnosticsRecorder(configuration: [
             "maximumDepthMetres": maximumReconstructionDepth, "icpIterationLimit": reconstructionIterationLimit,
             "focalLengthScaleFactor": cameraFocalLengthScaleFactor, "minimumCaptureDistance": minimumCaptureDistance,
+            "minimumTrackingDistance": minimumTrackingDistance,
             "maximumCaptureDistance": maximumCaptureDistance, "usesDeviceMotionGravity": usesDeviceMotionGravity,
             "maxDepthResolution": maxDepthResolution, "trackingRecoveryTime": trackingRecoveryTime,
             "reconstructsRecordedScan": reconstructsRecordedScan,
