@@ -9,7 +9,7 @@ import UIKit
 /// Private, opt-in RGBD journal. Payloads stream to durable storage; finalizing
 /// raw capture never depends on reconstruction success or a completed mesh.
 final class ScanDiagnosticsRecorder {
-    private let queue = DispatchQueue(label: "EigenScanDiagnostics.writer", qos: .utility)
+    private let queue: DispatchQueue
     private let lock = NSLock()
     private let startedAt = ProcessInfo.processInfo.systemUptime
     private let id = UUID().uuidString
@@ -31,6 +31,9 @@ final class ScanDiagnosticsRecorder {
     private var firstMotion: [String: Any]?
     private var gravity: [Any]?
     private var streams: [String: FileHandle] = [:]
+    private var writerFrameCount = 0
+    private var writerTotalSeconds: TimeInterval = 0
+    private var maximumWriterSeconds: TimeInterval = 0
     private var writerLock: Int32 = -1
     private(set) var directory: URL?
     private let maximumBytes = 4 * 1024 * 1024 * 1024
@@ -38,7 +41,11 @@ final class ScanDiagnosticsRecorder {
     private let maximumSeconds: TimeInterval = 90
     private let diskReserve: Int64 = 1024 * 1024 * 1024
 
-    init(configuration: [String: Any], onFailure: @escaping (String) -> Void) {
+    /// The injected writer queue must be serial, preserving capture/seal order.
+    init(configuration: [String: Any],
+         writerQueue: DispatchQueue = DispatchQueue(label: "EigenScanDiagnostics.writer", qos: .utility),
+         onFailure: @escaping (String) -> Void) {
+        queue = writerQueue
         self.configuration = configuration
         self.onFailure = onFailure
         do {
@@ -94,6 +101,69 @@ final class ScanDiagnosticsRecorder {
                 "userAcceleration": [a.x,a.y,a.z], "attitudeQuaternion": [q.x,q.y,q.z,q.w]]
     }
 
+    private static func calibrationData(_ calibration: AVCameraCalibrationData) -> [String: Any] {
+        let k = calibration.intrinsicMatrix.columns, e = calibration.extrinsicMatrix.columns
+        func numbers(_ values: [Float]) -> [Any] {
+            values.map { $0.isFinite ? NSNumber(value: $0) : NSNull() }
+        }
+        var result: [String: Any] = [
+            "intrinsicColumnMajor": numbers([k.0.x,k.0.y,k.0.z,k.1.x,k.1.y,k.1.z,k.2.x,k.2.y,k.2.z]),
+            "intrinsicReferenceSize": [calibration.intrinsicMatrixReferenceDimensions.width, calibration.intrinsicMatrixReferenceDimensions.height],
+            "extrinsicColumnMajor": numbers([e.0.x,e.0.y,e.0.z,e.1.x,e.1.y,e.1.z,e.2.x,e.2.y,e.2.z,e.3.x,e.3.y,e.3.z]),
+            "lensDistortionCenter": [calibration.lensDistortionCenter.x, calibration.lensDistortionCenter.y],
+            "pixelSize": calibration.pixelSize]
+        result["lensDistortionFloat32Base64"] = calibration.lensDistortionLookupTable?.base64EncodedString()
+        result["inverseLensDistortionFloat32Base64"] = calibration.inverseLensDistortionLookupTable?.base64EncodedString()
+        return result
+    }
+
+    /// Immutable byte ownership ends dependence on the camera's finite pixel-buffer
+    /// pool before slower compression, hashing and disk writes begin.
+    struct OwnedPixelBuffer {
+        let data: Data
+        let width: Int
+        let height: Int
+        let pixelFormat: OSType
+        let planes: [[String: Int]]
+
+        static func byteCount(of buffer: CVPixelBuffer) throws -> Int {
+            let count = CVPixelBufferGetPlaneCount(buffer)
+            var total = 0
+            for index in 0..<max(1, count) {
+                let height = count == 0 ? CVPixelBufferGetHeight(buffer) : CVPixelBufferGetHeightOfPlane(buffer, index)
+                let row = count == 0 ? CVPixelBufferGetBytesPerRow(buffer) : CVPixelBufferGetBytesPerRowOfPlane(buffer, index)
+                let (bytes, overflow) = height.multipliedReportingOverflow(by: row)
+                guard height > 0, row > 0, !overflow, bytes <= 96 * 1_024 * 1_024,
+                      total <= 96 * 1_024 * 1_024 - bytes else { throw CocoaError(.fileReadTooLarge) }
+                total += bytes
+            }
+            return total
+        }
+
+        init(copying buffer: CVPixelBuffer) throws {
+            let bytes = try Self.byteCount(of: buffer)
+            guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { throw CocoaError(.fileReadUnknown) }
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+            let count = CVPixelBufferGetPlaneCount(buffer)
+            var raw = Data(), copiedPlanes: [[String: Int]] = []
+            raw.reserveCapacity(bytes)
+            for index in 0..<max(1, count) {
+                let width = count == 0 ? CVPixelBufferGetWidth(buffer) : CVPixelBufferGetWidthOfPlane(buffer, index)
+                let height = count == 0 ? CVPixelBufferGetHeight(buffer) : CVPixelBufferGetHeightOfPlane(buffer, index)
+                let row = count == 0 ? CVPixelBufferGetBytesPerRow(buffer) : CVPixelBufferGetBytesPerRowOfPlane(buffer, index)
+                guard let base = count == 0 ? CVPixelBufferGetBaseAddress(buffer) : CVPixelBufferGetBaseAddressOfPlane(buffer, index) else { throw CocoaError(.fileReadUnknown) }
+                let length = height * row
+                copiedPlanes.append(["width": width, "height": height, "rowBytes": row, "dataOffset": raw.count, "byteCount": length])
+                raw.append(base.assumingMemoryBound(to: UInt8.self), count: length)
+            }
+            data = raw
+            width = CVPixelBufferGetWidth(buffer)
+            height = CVPixelBufferGetHeight(buffer)
+            pixelFormat = CVPixelBufferGetPixelFormatType(buffer)
+            planes = copiedPlanes
+        }
+    }
+
     func beginCapture() {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock(); captureStartedAt = now; lock.unlock()
@@ -106,12 +176,27 @@ final class ScanDiagnosticsRecorder {
     func recordFrame(color: CVPixelBuffer, depth: CVPixelBuffer, calibration: AVCameraCalibrationData,
                      colorTimestamp: CMTime, depthTimestamp: CMTime, motion: CMDeviceMotion?,
                      submission: [String: Any]) -> Int? {
-        let bytes = CVPixelBufferGetDataSize(color) + CVPixelBufferGetDataSize(depth)
+        recordFrame(color: color, depth: depth, calibration: Self.calibrationData(calibration),
+            colorTimestamp: colorTimestamp, depthTimestamp: depthTimestamp,
+            motion: motionData(motion), submission: submission)
+    }
+
+    /// Value metadata boundary also lets replay fixtures exercise the same writer
+    /// without constructing an AVFoundation-owned calibration object.
+    func recordFrame(color: CVPixelBuffer, depth: CVPixelBuffer, calibration: [String: Any],
+                     colorTimestamp: CMTime, depthTimestamp: CMTime, motion: [String: Any]?,
+                     submission: [String: Any]) -> Int? {
         let hostTime = ProcessInfo.processInfo.systemUptime
-        let motion = motionData(motion)
         lock.lock()
         guard !stopped, directory != nil else { lock.unlock(); return nil }
         receivedFrames += 1
+        let bytes: Int
+        do { bytes = try OwnedPixelBuffer.byteCount(of: color) + OwnedPixelBuffer.byteCount(of: depth) }
+        catch {
+            lock.unlock()
+            fail("Recording could not copy a camera buffer. The captured prefix has been saved.")
+            return nil
+        }
         let tooLong = ProcessInfo.processInfo.systemUptime - (captureStartedAt ?? startedAt) > maximumSeconds
         guard !tooLong, bytes > 0, pendingBytes + bytes <= maximumPendingBytes,
               totalBytes + pendingBytes + bytes <= maximumBytes else {
@@ -120,31 +205,43 @@ final class ScanDiagnosticsRecorder {
                 "Recording reached its storage or IO limit. The captured prefix has been saved.")
             return nil
         }
+        // Reserve and enqueue under the same lock as finish. No frame can be
+        // admitted after the seal, and no queued writer retains a sensor buffer.
+        let copyStarted = ProcessInfo.processInfo.systemUptime
+        let ownedColor: OwnedPixelBuffer, ownedDepth: OwnedPixelBuffer
+        do {
+            ownedColor = try OwnedPixelBuffer(copying: color)
+            ownedDepth = try OwnedPixelBuffer(copying: depth)
+        } catch {
+            lock.unlock()
+            fail("Recording could not copy a camera buffer. The captured prefix has been saved.")
+            return nil
+        }
+        let copyFinished = ProcessInfo.processInfo.systemUptime
         let sequence = nextSequence; nextSequence += 1; pendingBytes += bytes
         queue.async { [self] in
             defer { lock.lock(); pendingBytes -= bytes; lock.unlock() }
             autoreleasepool {
                 guard failureMessage == nil else { return }
+                let workStarted = ProcessInfo.processInfo.systemUptime
                 do {
                     if sequence % 16 == 0 { try requireDiskSpace() }
-                    let colorInfo = try writeBuffer(color, name: String(format: "%06d.color", sequence))
-                    let depthInfo = try writeBuffer(depth, name: String(format: "%06d.depth", sequence))
-                    let k = calibration.intrinsicMatrix.columns, e = calibration.extrinsicMatrix.columns
-                    var c: [String: Any] = [
-                        "intrinsicColumnMajor": numbers([k.0.x,k.0.y,k.0.z,k.1.x,k.1.y,k.1.z,k.2.x,k.2.y,k.2.z]),
-                        "intrinsicReferenceSize": [calibration.intrinsicMatrixReferenceDimensions.width, calibration.intrinsicMatrixReferenceDimensions.height],
-                        "extrinsicColumnMajor": numbers([e.0.x,e.0.y,e.0.z,e.1.x,e.1.y,e.1.z,e.2.x,e.2.y,e.2.z,e.3.x,e.3.y,e.3.z]),
-                        "lensDistortionCenter": [calibration.lensDistortionCenter.x, calibration.lensDistortionCenter.y],
-                        "pixelSize": calibration.pixelSize]
-                    c["lensDistortionFloat32Base64"] = calibration.lensDistortionLookupTable?.base64EncodedString()
-                    c["inverseLensDistortionFloat32Base64"] = calibration.inverseLensDistortionLookupTable?.base64EncodedString()
+                    let colorInfo = try writeBuffer(ownedColor, name: String(format: "%06d.color", sequence))
+                    let depthInfo = try writeBuffer(ownedDepth, name: String(format: "%06d.depth", sequence))
                     var frame: [String: Any] = ["sequence": sequence, "hostTimeSeconds": hostTime,
                         "colorTimestamp": Self.timestamp(colorTimestamp), "depthTimestamp": Self.timestamp(depthTimestamp),
-                        "color": colorInfo, "depth": depthInfo, "calibration": c, "submission": submission]
+                        "color": colorInfo, "depth": depthInfo, "calibration": calibration, "submission": submission,
+                        "recordingTiming": ["copySeconds": copyFinished - copyStarted,
+                            "writerQueueDelaySeconds": workStarted - copyFinished,
+                            "payloadEncodingAndWriteSeconds": ProcessInfo.processInfo.systemUptime - workStarted]]
                     if let motion { frame["motion"] = motion; if firstMotion == nil { firstMotion = motion } }
                     try append(frame, stream: "frames")
                     lock.lock(); recordedFrames += 1; lock.unlock()
                     try writeManifest()
+                    let duration = ProcessInfo.processInfo.systemUptime - workStarted
+                    writerFrameCount += 1
+                    writerTotalSeconds += duration
+                    maximumWriterSeconds = max(maximumWriterSeconds, duration)
                 } catch { fail("Recording stopped after a write failed: \(error.localizedDescription)") }
             }
         }
@@ -164,16 +261,19 @@ final class ScanDiagnosticsRecorder {
         lock.unlock()
     }
 
-    func recordCameraDrop(colorTimestamp: CMTime, depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool) {
+    func recordCameraDrop(colorTimestamp: CMTime, depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool,
+                          details: [String: Any] = [:]) {
         let hostTime = ProcessInfo.processInfo.systemUptime
         lock.lock()
         guard !finishing else { lock.unlock(); return }
         queue.async { [self] in
             if !issues.contains("Camera reported dropped synchronized data") { issues.append("Camera reported dropped synchronized data") }
             do {
-                try append(["event": "camera_drop", "hostTimeSeconds": hostTime,
+                var event: [String: Any] = ["event": "camera_drop", "hostTimeSeconds": hostTime,
                     "colorTimestamp": Self.timestamp(colorTimestamp), "depthTimestamp": Self.timestamp(depthTimestamp),
-                    "colorDropped": colorDropped, "depthDropped": depthDropped], stream: "events")
+                    "colorDropped": colorDropped, "depthDropped": depthDropped]
+                if !details.isEmpty { event["details"] = details }
+                try append(event, stream: "events")
             } catch { fail("Camera-drop journal write failed: \(error.localizedDescription)") }
         }
         lock.unlock()
@@ -236,21 +336,9 @@ final class ScanDiagnosticsRecorder {
         lock.lock(); totalBytes += data.count; lock.unlock()
     }
 
-    private func writeBuffer(_ buffer: CVPixelBuffer, name: String) throws -> [String: Any] {
+    private func writeBuffer(_ buffer: OwnedPixelBuffer, name: String) throws -> [String: Any] {
         guard let directory else { throw CocoaError(.fileNoSuchFile) }
-        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { throw CocoaError(.fileReadUnknown) }
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        let count = CVPixelBufferGetPlaneCount(buffer)
-        var raw = Data(), planes: [[String: Int]] = []
-        for index in 0..<max(1, count) {
-            let width = count == 0 ? CVPixelBufferGetWidth(buffer) : CVPixelBufferGetWidthOfPlane(buffer, index)
-            let height = count == 0 ? CVPixelBufferGetHeight(buffer) : CVPixelBufferGetHeightOfPlane(buffer, index)
-            let rowBytes = count == 0 ? CVPixelBufferGetBytesPerRow(buffer) : CVPixelBufferGetBytesPerRowOfPlane(buffer, index)
-            guard let base = count == 0 ? CVPixelBufferGetBaseAddress(buffer) : CVPixelBufferGetBaseAddressOfPlane(buffer, index) else { throw CocoaError(.fileReadUnknown) }
-            let bytes = height * rowBytes
-            planes.append(["width": width, "height": height, "rowBytes": rowBytes, "dataOffset": raw.count, "byteCount": bytes])
-            raw.append(base.assumingMemoryBound(to: UInt8.self), count: bytes)
-        }
+        let raw = buffer.data
         let compressed: Data? = (try? (raw as NSData).compressed(using: .lzfse)).map { $0 as Data }
         let useCompressed = compressed.map { $0.count < raw.count } ?? false
         let payload = useCompressed ? compressed! : raw
@@ -260,8 +348,8 @@ final class ScanDiagnosticsRecorder {
         return ["file": relative, "compression": useCompressed ? "lzfse" : "none",
             "sha256": SHA256.hash(data: raw).map { String(format: "%02x", $0) }.joined(),
             "byteCount": raw.count, "storedByteCount": payload.count,
-            "width": CVPixelBufferGetWidth(buffer), "height": CVPixelBufferGetHeight(buffer),
-            "pixelFormat": CVPixelBufferGetPixelFormatType(buffer), "planes": planes]
+            "width": buffer.width, "height": buffer.height,
+            "pixelFormat": buffer.pixelFormat, "planes": buffer.planes]
     }
 
     private func requireDiskSpace() throws {
@@ -289,6 +377,9 @@ final class ScanDiagnosticsRecorder {
             "appVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
             "appBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
             "captureImplementation": "eigen-rgbd-journal-2", "clockOriginHostSeconds": startedAt,
+            "bufferOwnership": "Camera buffers are copied before asynchronous compression and disk writes",
+            "writerTiming": ["completedFrameTasks": writerFrameCount, "totalSeconds": writerTotalSeconds,
+                "maximumFrameSeconds": maximumWriterSeconds],
             "motionSampling": "Latest CMDeviceMotion at each synchronized camera pair; not a continuous raw IMU log",
             "streams": ["frames": "frames.jsonl", "events": "events.jsonl", "tracking": "tracking.jsonl"],
             "limits": ["maximumStoredBytes": maximumBytes, "maximumPendingBytes": maximumPendingBytes,

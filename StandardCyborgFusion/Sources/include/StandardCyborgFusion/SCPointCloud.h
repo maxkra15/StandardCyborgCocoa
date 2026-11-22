@@ -7,6 +7,27 @@
 #import <Foundation/Foundation.h>
 #import <simd/simd.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/** The fixed orientation used by the SDK's calibrated depth unprojection. */
+FOUNDATION_EXPORT simd_float3x3 SCReconstructionCameraOrientationMatrix(void);
+
+/**
+ Converts Core Motion hardware-frame gravity into the initial reconstruction
+ camera frame, using the same rotation as depth unprojection. Translation is
+ ignored because gravity is a direction. The historical input mirror option
+ reflects raw image rows and is included in this mapping. Returns all-NaN for
+ invalid gravity or a nonfinite/nonrigid calibration rotation.
+ */
+FOUNDATION_EXPORT simd_float3 SCReconstructionGravityForDeviceGravity(
+    simd_float3 deviceGravity, simd_float4x3 calibrationExtrinsic, BOOL flipsInputHorizontally);
+
+#ifdef __cplusplus
+}
+#endif
+
 @interface SCPointCloud : NSObject
 
 /** The interval between each point's interleaved position, normal, etc data */

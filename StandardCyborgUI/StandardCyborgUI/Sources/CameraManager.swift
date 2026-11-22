@@ -14,6 +14,7 @@ import UIKit
     func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData)
     @objc optional func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer, depthCalibrationData: AVCameraCalibrationData, colorTimestamp: CMTime, depthTimestamp: CMTime)
     @objc optional func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime, depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool)
+    @objc optional func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime, depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool, details: [String: Any])
     @objc optional func cameraManager(_ manager: CameraManager, didInterrupt message: String)
     @objc optional func cameraManagerDidStartSession(_ manager: CameraManager)
     @objc optional func cameraManagerDidNotStartSession(_ manager: CameraManager, result: CameraManager.SessionSetupResult)
@@ -316,19 +317,23 @@ public extension Notification.Name {
         guard _dataOutputQueue_renderingEnabled else { return }
         
         // Read all outputs
-        guard
-            let syncedDepthData: AVCaptureSynchronizedDepthData =
-                    synchronizedDataCollection.synchronizedData(for: _depthDataOutput) as? AVCaptureSynchronizedDepthData,
-            let syncedVideoData: AVCaptureSynchronizedSampleBufferData =
-                    synchronizedDataCollection.synchronizedData(for: _videoDataOutput) as? AVCaptureSynchronizedSampleBufferData
-        else {
-            delegate?.cameraManager?(self, didDropColorAt: .invalid, depthAt: .invalid, colorDropped: true, depthDropped: true)
+        let depthOutput = synchronizedDataCollection.synchronizedData(for: _depthDataOutput) as? AVCaptureSynchronizedDepthData
+        let colorOutput = synchronizedDataCollection.synchronizedData(for: _videoDataOutput) as? AVCaptureSynchronizedSampleBufferData
+        guard let syncedDepthData = depthOutput, let syncedVideoData = colorOutput else {
+            _reportDrop(colorTimestamp: colorOutput?.timestamp ?? .invalid, depthTimestamp: depthOutput?.timestamp ?? .invalid,
+                colorDropped: colorOutput?.sampleBufferWasDropped ?? true,
+                depthDropped: depthOutput?.depthDataWasDropped ?? true,
+                details: ["reason": "missing_synchronized_output", "missingColorOutput": colorOutput == nil,
+                    "missingDepthOutput": depthOutput == nil])
             return /* Only work on synced pairs; retain an explicit gap in diagnostics. */
         }
         
         guard !syncedDepthData.depthDataWasDropped && !syncedVideoData.sampleBufferWasDropped else {
-            delegate?.cameraManager?(self, didDropColorAt: syncedVideoData.timestamp, depthAt: syncedDepthData.timestamp,
-                colorDropped: syncedVideoData.sampleBufferWasDropped, depthDropped: syncedDepthData.depthDataWasDropped)
+            _reportDrop(colorTimestamp: syncedVideoData.timestamp, depthTimestamp: syncedDepthData.timestamp,
+                colorDropped: syncedVideoData.sampleBufferWasDropped, depthDropped: syncedDepthData.depthDataWasDropped,
+                details: ["reason": "synchronized_sample_dropped",
+                    "colorDropReason": Self.dropReason(syncedVideoData.droppedReason),
+                    "depthDropReason": Self.dropReason(syncedDepthData.droppedReason)])
             return
         }
         
@@ -338,9 +343,12 @@ public extension Notification.Name {
         let sampleBuffer = syncedVideoData.sampleBuffer
         guard let colorBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let depthCalibrationData = depthData.cameraCalibrationData else {
-            delegate?.cameraManager?(self, didDropColorAt: syncedVideoData.timestamp, depthAt: syncedDepthData.timestamp,
+            _reportDrop(colorTimestamp: syncedVideoData.timestamp, depthTimestamp: syncedDepthData.timestamp,
                 colorDropped: CMSampleBufferGetImageBuffer(sampleBuffer) == nil,
-                depthDropped: depthData.cameraCalibrationData == nil)
+                depthDropped: depthData.cameraCalibrationData == nil,
+                details: ["reason": "missing_buffer_or_calibration",
+                    "missingColorBuffer": CMSampleBufferGetImageBuffer(sampleBuffer) == nil,
+                    "missingDepthCalibration": depthData.cameraCalibrationData == nil])
             return
         }
         
@@ -348,6 +356,25 @@ public extension Notification.Name {
             depthCalibrationData: depthCalibrationData, colorTimestamp: syncedVideoData.timestamp,
             depthTimestamp: syncedDepthData.timestamp) == nil {
             delegate?.cameraDidOutput(colorBuffer: colorBuffer, depthBuffer: depthBuffer, depthCalibrationData: depthCalibrationData)
+        }
+    }
+
+    static func dropReason(_ reason: AVCaptureOutput.DataDroppedReason) -> String {
+        switch reason {
+        case .none: return "none"
+        case .lateData: return "late_data"
+        case .outOfBuffers: return "out_of_buffers"
+        case .discontinuity: return "discontinuity"
+        @unknown default: return "unknown_\(reason.rawValue)"
+        }
+    }
+
+    private func _reportDrop(colorTimestamp: CMTime, depthTimestamp: CMTime,
+                             colorDropped: Bool, depthDropped: Bool, details: [String: Any]) {
+        if delegate?.cameraManager?(self, didDropColorAt: colorTimestamp, depthAt: depthTimestamp,
+            colorDropped: colorDropped, depthDropped: depthDropped, details: details) == nil {
+            delegate?.cameraManager?(self, didDropColorAt: colorTimestamp, depthAt: depthTimestamp,
+                colorDropped: colorDropped, depthDropped: depthDropped)
         }
     }
     

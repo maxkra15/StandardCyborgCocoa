@@ -331,10 +331,17 @@ import UIKit
 
     public func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime,
                               depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool) {
+        cameraManager(manager, didDropColorAt: colorTimestamp, depthAt: depthTimestamp,
+                      colorDropped: colorDropped, depthDropped: depthDropped, details: [:])
+    }
+
+    public func cameraManager(_ manager: CameraManager, didDropColorAt colorTimestamp: CMTime,
+                              depthAt depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool,
+                              details: [String: Any]) {
         var recorder: ScanDiagnosticsRecorder?
         DispatchQueue.main.sync { if self._state == .scanning { recorder = self._diagnostics } }
         recorder?.recordCameraDrop(colorTimestamp: colorTimestamp, depthTimestamp: depthTimestamp,
-                                   colorDropped: colorDropped, depthDropped: depthDropped)
+                                   colorDropped: colorDropped, depthDropped: depthDropped, details: details)
     }
 
     public func cameraDidOutput(colorBuffer: CVPixelBuffer, depthBuffer: CVPixelBuffer,
@@ -379,7 +386,10 @@ import UIKit
             if shouldAccumulate && self.usesDeviceMotionGravity && self._captureState.gravity == nil {
                 if let motion = self._motionManager.deviceMotion {
                     let g = motion.gravity
-                    shouldAccumulate = self._captureState.recordInitialGravity(SIMD3(Float(g.x), Float(g.y), Float(g.z)))
+                    let deviceGravity = SIMD3(Float(g.x), Float(g.y), Float(g.z))
+                    let reconstructionGravity = SCReconstructionGravityForDeviceGravity(
+                        deviceGravity, depthCalibrationData.extrinsicMatrix, self.mirrorModeEnabled)
+                    shouldAccumulate = self._captureState.recordInitialGravity(reconstructionGravity)
                 } else {
                     shouldAccumulate = false
                 }
@@ -531,6 +541,7 @@ import UIKit
             "maximumCaptureDistance": maximumCaptureDistance, "usesDeviceMotionGravity": usesDeviceMotionGravity,
             "maxDepthResolution": maxDepthResolution, "trackingRecoveryTime": trackingRecoveryTime,
             "reconstructsRecordedScan": reconstructsRecordedScan,
+            "gravityCoordinateFrame": "fusion_camera_v1",
             "flipsInputHorizontally": mirrorModeEnabled, "normalizedFrameClipRegion": [0,0,0,0]
         ]) { [weak self] message in self?._failCapture(message) }
         _diagnostics = recorder

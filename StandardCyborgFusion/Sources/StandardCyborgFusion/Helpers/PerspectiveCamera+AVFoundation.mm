@@ -15,8 +15,55 @@
 #import "EigenHelpers.hpp"
 #import "GeometryHelpers.hpp"
 #import "PerspectiveCamera+AVFoundation.hpp"
+#import <StandardCyborgFusion/SCPointCloud.h>
+#include <cmath>
+#include <limits>
 
 using namespace standard_cyborg;
+
+simd_float3x3 SCReconstructionCameraOrientationMatrix(void)
+{
+    return simd_matrix(simd_make_float3(0, 1, 0),
+                       simd_make_float3(1, 0, 0),
+                       simd_make_float3(0, 0, -1));
+}
+
+simd_float3 SCReconstructionGravityForDeviceGravity(
+    simd_float3 deviceGravity, simd_float4x3 calibrationExtrinsic, BOOL flipsInputHorizontally)
+{
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const simd_float3 invalid = simd_make_float3(nan, nan, nan);
+    if (!std::isfinite(deviceGravity.x) || !std::isfinite(deviceGravity.y) || !std::isfinite(deviceGravity.z)) {
+        return invalid;
+    }
+    const float length = simd_length(deviceGravity);
+    if (!std::isfinite(length) || length < 0.5f || length > 1.5f) { return invalid; }
+    const simd_float3x3 rotation = simd_matrix(calibrationExtrinsic.columns[0],
+                                              calibrationExtrinsic.columns[1],
+                                              calibrationExtrinsic.columns[2]);
+    for (int column = 0; column < 3; ++column) {
+        for (int row = 0; row < 3; ++row) {
+            if (!std::isfinite(rotation.columns[column][row])) { return invalid; }
+        }
+    }
+    const simd_float3x3 gram = simd_mul(simd_transpose(rotation), rotation);
+    for (int column = 0; column < 3; ++column) {
+        for (int row = 0; row < 3; ++row) {
+            if (std::abs(gram.columns[column][row] - (column == row ? 1.0f : 0.0f)) > 0.002f) {
+                return invalid;
+            }
+        }
+    }
+    if (std::abs(simd_determinant(rotation) - 1.0f) > 0.002f) { return invalid; }
+    const simd_float3x3 orientation = SCReconstructionCameraOrientationMatrix();
+    // PerspectiveCamera uses V = R * O and transforms sensor rays by V^-1.
+    // O also maps baseline Core Motion axes into the SDK's pre-view camera axes.
+    // Apply that same basis change to gravity rather than treating a device
+    // vector as if it were already in the model's initial camera coordinates.
+    simd_float3 cameraGravity = simd_mul(orientation, deviceGravity / length);
+    if (flipsInputHorizontally) { cameraGravity.y = -cameraGravity.y; }
+    return simd_mul(simd_transpose(orientation), simd_mul(simd_transpose(rotation), cameraGravity));
+}
 
 sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCalibrationData *calibrationData, size_t pixelsWide, size_t pixelsHigh, float focalLengthScaleFactor)
 {
@@ -48,10 +95,11 @@ sc3d::PerspectiveCamera PerspectiveCameraFromAVCameraCalibrationData(AVCameraCal
     // z axis by 90 degrees so that the model is unprojected out along the negative z axis. This
     // means that if you look at the screen with x to the right and y up, then you see the model
     // in front of you.
+    const simd_float3x3 outputOrientation = SCReconstructionCameraOrientationMatrix();
     math::Mat3x4 desiredOrientation({
-        0, 1, 0, 0,
-        1, 0, 0, 0,
-        0, 0, -1, 0
+        outputOrientation.columns[0].x, outputOrientation.columns[1].x, outputOrientation.columns[2].x, 0,
+        outputOrientation.columns[0].y, outputOrientation.columns[1].y, outputOrientation.columns[2].y, 0,
+        outputOrientation.columns[0].z, outputOrientation.columns[1].z, outputOrientation.columns[2].z, 0
     });
     // We construct a baseline extrinsic matrix strictly to nail down our desired output given
     // expected input, with the additional expectation that if the extrinsic matrix returned by
