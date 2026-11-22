@@ -1,12 +1,11 @@
 import AVFoundation
-import Compression
 import CoreMotion
 import CryptoKit
 import Darwin
 import StandardCyborgFusion
 import UIKit
 
-/// Private, opt-in RGBD journal. Payloads stream to durable storage; finalizing
+/// Private RGBD journal. Payloads stream to durable storage; finalizing
 /// raw capture never depends on reconstruction success or a completed mesh.
 final class ScanDiagnosticsRecorder {
     private let queue: DispatchQueue
@@ -21,9 +20,11 @@ final class ScanDiagnosticsRecorder {
     private var captureStartedAt: TimeInterval?
     private var stopped = false
     private var failure: String?
+    private var writerFailure: String?
     private var finishing = false
     private var recordedFrames = 0
     private var receivedFrames = 0
+    private var recorderOverrunCount = 0
     private var totalBytes = 0
     private var issues: [String] = []
     private var finalReason = "Recording has not been finalized"
@@ -34,18 +35,24 @@ final class ScanDiagnosticsRecorder {
     private var writerFrameCount = 0
     private var writerTotalSeconds: TimeInterval = 0
     private var maximumWriterSeconds: TimeInterval = 0
+    private var lastCheckpointTime = 0.0
     private var writerLock: Int32 = -1
     private(set) var directory: URL?
-    private let maximumBytes = 4 * 1024 * 1024 * 1024
-    private let maximumPendingBytes = 64 * 1024 * 1024
+    private let maximumBytes: Int
+    private let maximumPendingBytes: Int
+    private let checkpointInterval: TimeInterval = 0.5
     private let maximumSeconds: TimeInterval = 90
     private let diskReserve: Int64 = 1024 * 1024 * 1024
 
     /// The injected writer queue must be serial, preserving capture/seal order.
     init(configuration: [String: Any],
-         writerQueue: DispatchQueue = DispatchQueue(label: "EigenScanDiagnostics.writer", qos: .utility),
+         writerQueue: DispatchQueue = DispatchQueue(label: "EigenScanDiagnostics.writer", qos: .userInitiated),
+         maximumPendingBytes: Int = 64 * 1024 * 1024,
+         maximumBytes: Int = 4 * 1024 * 1024 * 1024,
          onFailure: @escaping (String) -> Void) {
         queue = writerQueue
+        self.maximumPendingBytes = maximumPendingBytes
+        self.maximumBytes = maximumBytes
         self.configuration = configuration
         self.onFailure = onFailure
         do {
@@ -75,8 +82,9 @@ final class ScanDiagnosticsRecorder {
                 streams[name] = try FileHandle(forWritingTo: url)
             }
             try writeManifest() // durable attempt metadata exists before camera startup
+            lastCheckpointTime = ProcessInfo.processInfo.systemUptime
             try requireDiskSpace()
-        } catch { fail("Could not start the private recording: \(error.localizedDescription)") }
+        } catch { failWriting("Could not start the private recording", error: error) }
     }
 
     deinit {
@@ -118,7 +126,7 @@ final class ScanDiagnosticsRecorder {
     }
 
     /// Immutable byte ownership ends dependence on the camera's finite pixel-buffer
-    /// pool before slower compression, hashing and disk writes begin.
+    /// pool before hashing and disk writes begin.
     struct OwnedPixelBuffer {
         let data: Data
         let width: Int
@@ -170,9 +178,8 @@ final class ScanDiagnosticsRecorder {
         recordEvent("capture_started", fields: ["hostTimeSeconds": now])
     }
 
-    /// Retains at most the bounded pending buffer bytes; IO/compression occurs on
-    /// one worker. A rejected admission stops capture rather than silently losing
-    /// reconstruction inputs. Caller must not submit a rejected frame to fusion.
+    /// Retains at most the bounded pending buffer bytes. A temporarily full queue
+    /// logs an explicit gap and capture continues. Fusion only receives admitted pairs.
     func recordFrame(color: CVPixelBuffer, depth: CVPixelBuffer, calibration: AVCameraCalibrationData,
                      colorTimestamp: CMTime, depthTimestamp: CMTime, motion: CMDeviceMotion?,
                      submission: [String: Any]) -> Int? {
@@ -198,11 +205,27 @@ final class ScanDiagnosticsRecorder {
             return nil
         }
         let tooLong = ProcessInfo.processInfo.systemUptime - (captureStartedAt ?? startedAt) > maximumSeconds
-        guard !tooLong, bytes > 0, pendingBytes + bytes <= maximumPendingBytes,
-              totalBytes + pendingBytes + bytes <= maximumBytes else {
+        if tooLong {
             lock.unlock()
-            fail(tooLong ? "The 90-second recording limit was reached. The captured prefix has been saved." :
-                "Recording reached its storage or IO limit. The captured prefix has been saved.")
+            fail("The 90-second recording limit was reached. The recording has been saved.")
+            return nil
+        }
+        if bytes > maximumPendingBytes {
+            lock.unlock()
+            fail("A camera frame was too large to record. The recording has been saved.")
+            return nil
+        }
+        if pendingBytes + bytes > maximumPendingBytes {
+            recorderOverrunCount += 1
+            enqueueEvent(["event": "recorder_overrun", "hostTimeSeconds": hostTime,
+                "colorTimestamp": Self.timestamp(colorTimestamp), "depthTimestamp": Self.timestamp(depthTimestamp),
+                "frameBytes": bytes])
+            lock.unlock()
+            return nil
+        }
+        if totalBytes + pendingBytes + bytes > maximumBytes {
+            lock.unlock()
+            fail("This recording reached its storage limit. The recording has been saved.")
             return nil
         }
         // Reserve and enqueue under the same lock as finish. No frame can be
@@ -220,14 +243,25 @@ final class ScanDiagnosticsRecorder {
         let copyFinished = ProcessInfo.processInfo.systemUptime
         let sequence = nextSequence; nextSequence += 1; pendingBytes += bytes
         queue.async { [self] in
-            defer { lock.lock(); pendingBytes -= bytes; lock.unlock() }
+            var payloadBytes = 0
+            var reservedBytes = bytes
+            defer {
+                lock.lock()
+                totalBytes += payloadBytes
+                pendingBytes -= reservedBytes
+                lock.unlock()
+            }
             autoreleasepool {
-                guard failureMessage == nil else { return }
+                // Reaching a capture limit closes admission. Already accepted
+                // pairs can still be written unless the writer itself failed.
+                guard !hasWriterFailure else { return }
                 let workStarted = ProcessInfo.processInfo.systemUptime
                 do {
                     if sequence % 16 == 0 { try requireDiskSpace() }
                     let colorInfo = try writeBuffer(ownedColor, name: String(format: "%06d.color", sequence))
+                    payloadBytes += ownedColor.data.count
                     let depthInfo = try writeBuffer(ownedDepth, name: String(format: "%06d.depth", sequence))
+                    payloadBytes += ownedDepth.data.count
                     var frame: [String: Any] = ["sequence": sequence, "hostTimeSeconds": hostTime,
                         "colorTimestamp": Self.timestamp(colorTimestamp), "depthTimestamp": Self.timestamp(depthTimestamp),
                         "color": colorInfo, "depth": depthInfo, "calibration": calibration, "submission": submission,
@@ -236,13 +270,19 @@ final class ScanDiagnosticsRecorder {
                             "payloadEncodingAndWriteSeconds": ProcessInfo.processInfo.systemUptime - workStarted]]
                     if let motion { frame["motion"] = motion; if firstMotion == nil { firstMotion = motion } }
                     try append(frame, stream: "frames")
-                    lock.lock(); recordedFrames += 1; lock.unlock()
-                    try writeManifest()
+                    lock.lock()
+                    totalBytes += payloadBytes
+                    pendingBytes -= bytes
+                    recordedFrames += 1
+                    lock.unlock()
+                    payloadBytes = 0
+                    reservedBytes = 0
                     let duration = ProcessInfo.processInfo.systemUptime - workStarted
                     writerFrameCount += 1
                     writerTotalSeconds += duration
                     maximumWriterSeconds = max(maximumWriterSeconds, duration)
-                } catch { fail("Recording stopped after a write failed: \(error.localizedDescription)") }
+                    try checkpointIfDue()
+                } catch { failWriting("Recording stopped because a write failed", error: error) }
             }
         }
         lock.unlock()
@@ -254,11 +294,19 @@ final class ScanDiagnosticsRecorder {
         if data["hostTimeSeconds"] == nil { data["hostTimeSeconds"] = ProcessInfo.processInfo.systemUptime }
         lock.lock()
         guard !finishing else { lock.unlock(); return }
-        queue.async { [self] in
-            do { try append(data, stream: "events") }
-            catch { fail("Recording event write failed: \(error.localizedDescription)") }
-        }
+        enqueueEvent(data)
         lock.unlock()
+    }
+
+    /// Called with the admission lock held so a gap cannot land behind the seal.
+    private func enqueueEvent(_ data: [String: Any]) {
+        queue.async { [self] in
+            guard !hasWriterFailure else { return }
+            do {
+                try append(data, stream: "events")
+                try checkpointIfDue()
+            } catch { failWriting("Recording event write failed", error: error) }
+        }
     }
 
     func recordCameraDrop(colorTimestamp: CMTime, depthTimestamp: CMTime, colorDropped: Bool, depthDropped: Bool,
@@ -267,6 +315,7 @@ final class ScanDiagnosticsRecorder {
         lock.lock()
         guard !finishing else { lock.unlock(); return }
         queue.async { [self] in
+            guard !hasWriterFailure else { return }
             if !issues.contains("Camera reported dropped synchronized data") { issues.append("Camera reported dropped synchronized data") }
             do {
                 var event: [String: Any] = ["event": "camera_drop", "hostTimeSeconds": hostTime,
@@ -274,7 +323,8 @@ final class ScanDiagnosticsRecorder {
                     "colorDropped": colorDropped, "depthDropped": depthDropped]
                 if !details.isEmpty { event["details"] = details }
                 try append(event, stream: "events")
-            } catch { fail("Camera-drop journal write failed: \(error.localizedDescription)") }
+                try checkpointIfDue()
+            } catch { failWriting("Camera-drop journal write failed", error: error) }
         }
         lock.unlock()
     }
@@ -291,8 +341,11 @@ final class ScanDiagnosticsRecorder {
         lock.lock()
         guard !finishing else { lock.unlock(); return }
         queue.async { [self] in
-            do { try append(event, stream: "tracking") }
-            catch { fail("Tracking journal write failed: \(error.localizedDescription)") }
+            guard !hasWriterFailure else { return }
+            do {
+                try append(event, stream: "tracking")
+                try checkpointIfDue()
+            } catch { failWriting("Tracking journal write failed", error: error) }
         }
         lock.unlock()
     }
@@ -305,7 +358,6 @@ final class ScanDiagnosticsRecorder {
             finalReason = reason
             if incomplete { issues.append(reason) }
             if let gravity { self.gravity = numbers([gravity.x,gravity.y,gravity.z]) }
-            if let failure = failureMessage, !issues.contains(failure) { issues.append(failure) }
             finalized = true
             do {
                 try append(["event": "capture_stopped", "reason": reason,
@@ -332,22 +384,26 @@ final class ScanDiagnosticsRecorder {
     private func append(_ object: [String: Any], stream: String) throws {
         let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) + Data([10])
         guard let handle = streams[stream] else { throw CocoaError(.fileWriteUnknown) }
-        try handle.write(contentsOf: data); try handle.synchronize()
+        try handle.write(contentsOf: data)
         lock.lock(); totalBytes += data.count; lock.unlock()
+    }
+
+    private func checkpointIfDue() throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastCheckpointTime >= checkpointInterval else { return }
+        for stream in streams.values { try stream.synchronize() }
+        try writeManifest()
+        lastCheckpointTime = now
     }
 
     private func writeBuffer(_ buffer: OwnedPixelBuffer, name: String) throws -> [String: Any] {
         guard let directory else { throw CocoaError(.fileNoSuchFile) }
         let raw = buffer.data
-        let compressed: Data? = (try? (raw as NSData).compressed(using: .lzfse)).map { $0 as Data }
-        let useCompressed = compressed.map { $0.count < raw.count } ?? false
-        let payload = useCompressed ? compressed! : raw
-        let relative = "frames/\(name).\(useCompressed ? "lzfse" : "raw")"
-        try payload.write(to: directory.appendingPathComponent(relative), options: [.atomic, .completeFileProtection])
-        lock.lock(); totalBytes += payload.count; lock.unlock()
-        return ["file": relative, "compression": useCompressed ? "lzfse" : "none",
+        let relative = "frames/\(name).raw"
+        try raw.write(to: directory.appendingPathComponent(relative), options: [.atomic, .completeFileProtection])
+        return ["file": relative, "compression": "none",
             "sha256": SHA256.hash(data: raw).map { String(format: "%02x", $0) }.joined(),
-            "byteCount": raw.count, "storedByteCount": payload.count,
+            "byteCount": raw.count, "storedByteCount": raw.count,
             "width": buffer.width, "height": buffer.height,
             "pixelFormat": buffer.pixelFormat, "planes": buffer.planes]
     }
@@ -362,22 +418,29 @@ final class ScanDiagnosticsRecorder {
         guard let directory else { throw CocoaError(.fileNoSuchFile) }
         lock.lock()
         let bytes = totalBytes, frames = recordedFrames, received = receivedFrames, captureStart = captureStartedAt
+        let overruns = recorderOverrunCount, failure = self.failure, writerFailure = self.writerFailure
         lock.unlock()
-        let failure = failureMessage
+        var reportedIssues = issues
+        if overruns > 0 { reportedIssues.append("Recorder could not keep up with all synchronized frames") }
+        for message in [failure, writerFailure].compactMap({ $0 }) where !reportedIssues.contains(message) {
+            reportedIssues.append(message)
+        }
+        let isComplete = finalized && reportedIssues.isEmpty && frames == received
         var manifest: [String: Any] = ["format": "eigen-scan-diagnostics", "version": 2, "id": id,
             "createdAt": createdAt, "updatedAt": ISO8601DateFormatter().string(from: Date()),
             "processIdentifier": ProcessInfo.processInfo.processIdentifier,
-            "finalized": finalized, "completeSequence": finalized && issues.isEmpty && failure == nil && frames == received,
+            "finalized": finalized, "completeSequence": isComplete,
             "completedLiveFusion": false, "liveTraceComplete": false,
-            "state": !finalized ? "recording" : (issues.isEmpty && failure == nil && frames == received ? "complete" : "incomplete"),
+            "state": !finalized ? "recording" : (isComplete ? "complete" : "incomplete"),
             "reason": finalReason, "recordedFrameCount": frames, "receivedFrameCount": received,
-            "totalBytes": bytes, "totalBytesMeaning": "Compressed payload bytes plus JSONL bytes; excludes manifest",
-            "issues": issues, "configuration": configuration,
+            "recorderOverrunCount": overruns,
+            "totalBytes": bytes, "totalBytesMeaning": "Stored payload bytes plus JSONL bytes; excludes manifest",
+            "issues": reportedIssues, "configuration": configuration,
             "device": UIDevice.current.model, "systemVersion": UIDevice.current.systemVersion,
             "appVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
             "appBuild": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
             "captureImplementation": "eigen-rgbd-journal-2", "clockOriginHostSeconds": startedAt,
-            "bufferOwnership": "Camera buffers are copied before asynchronous compression and disk writes",
+            "bufferOwnership": "Camera buffers are copied before asynchronous disk writes",
             "writerTiming": ["completedFrameTasks": writerFrameCount, "totalSeconds": writerTotalSeconds,
                 "maximumFrameSeconds": maximumWriterSeconds],
             "motionSampling": "Latest CMDeviceMotion at each synchronized camera pair; not a continuous raw IMU log",
@@ -392,17 +455,27 @@ final class ScanDiagnosticsRecorder {
         try data.write(to: directory.appendingPathComponent("manifest.json"), options: [.atomic, .completeFileProtection])
     }
 
-    private func fail(_ message: String) {
+    private func failWriting(_ operation: String, error: Error) {
+        let cocoaError = error as NSError
+        if cocoaError.domain == NSCocoaErrorDomain, cocoaError.code == CocoaError.fileWriteOutOfSpace.rawValue {
+            fail("This iPhone is low on space for recordings. Free some space and try again.", writerUnavailable: true)
+        } else {
+            fail("\(operation): \(error.localizedDescription)", writerUnavailable: true)
+        }
+    }
+
+    private func fail(_ message: String, writerUnavailable: Bool = false) {
         lock.lock()
+        if writerUnavailable && writerFailure == nil { writerFailure = message }
         guard failure == nil else { lock.unlock(); return }
         failure = message; stopped = true
         lock.unlock()
         DispatchQueue.main.async { self.onFailure(message) }
     }
 
-    private var failureMessage: String? {
+    private var hasWriterFailure: Bool {
         lock.lock(); defer { lock.unlock() }
-        return failure
+        return writerFailure != nil
     }
 
     private func releaseWriterLock() {
