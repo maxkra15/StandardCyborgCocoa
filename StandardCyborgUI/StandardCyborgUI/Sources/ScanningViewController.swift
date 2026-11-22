@@ -47,6 +47,10 @@ import UIKit
     private let _motionManager = CMMotionManager()
     private var _captureState = ScanCaptureState()
     public var recordsScanDiagnostics = false
+    /// Set before loading the view to retain ordinary metric capture while saving
+    /// its raw recording. False preserves the existing replay-only SDK behavior.
+    public var reconstructsRecordedScan = false
+    private var isReplayOnlyCapture: Bool { recordsScanDiagnostics && !reconstructsRecordedScan }
     public var reconstructionIterationLimit: Int32 = 0
     public var minimumCaptureDistance: Float = 0
     public var maximumCaptureDistance: Float = 0.5
@@ -109,7 +113,7 @@ import UIKit
     /** Starts scanning immediately */
     @objc public func startScanning() {
         guard !_isCompletingCapture else { return }
-        if !recordsScanDiagnostics && minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
+        if !isReplayOnlyCapture && minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
             _state = .default
             delegate?.scanningViewController?(self, captureGuidance: _depthGuidance?.message ?? "Aim at the whole foot and wait for depth detail.")
             return
@@ -118,7 +122,7 @@ import UIKit
         _captureState.begin()
         _prepareDiagnosticsIfNeeded()
         _diagnostics?.beginCapture()
-        if usesDeviceMotionGravity && !recordsScanDiagnostics {
+        if usesDeviceMotionGravity && !isReplayOnlyCapture {
             guard _motionManager.isDeviceMotionAvailable, _motionManager.deviceMotion != nil else {
                 _failCapture("Motion sensing is not ready. Hold the phone still for a moment, then try again.")
                 return
@@ -142,9 +146,11 @@ import UIKit
 
     /** Stops scanning immediately */
     @objc public func stopScanning(reason: ScanningTerminationReason) {
+        guard !_isCompletingCapture else { return }
         if _diagnostics != nil {
             _stopDiagnosticCapture(reason: reason == .finished ? "Stopped by recording button" : "Capture canceled",
-                                   incomplete: reason == .canceled)
+                                   incomplete: reason == .canceled,
+                                   reconstruct: reconstructsRecordedScan && reason == .finished)
             return
         }
         if reason == .canceled { _captureLifetime.invalidate() }
@@ -163,43 +169,8 @@ import UIKit
         if reason == .finished {
             let completionGeneration = _captureLifetime.generation
             _isCompletingCapture = true
-            _cameraManager.stopSession()
-            
-            meshTexturing.cameraCalibrationData = _reconstructionManager.latestCameraCalibrationData
-            meshTexturing.cameraCalibrationFrameWidth = _reconstructionManager.latestCameraCalibrationFrameWidth
-            meshTexturing.cameraCalibrationFrameHeight = _reconstructionManager.latestCameraCalibrationFrameHeight
-            
-            // Do final cleanup on the scan
-            _reconstructionManager.finalize {
-                guard self._captureLifetime.accepts(completionGeneration) else {
-                    self._diagnostics = nil
-                    self._reconstructionManager.reset()
-                    self._isCompletingCapture = false
-                    return
-                }
-                let rawCloud = self._reconstructionManager.buildPointCloud()
-                let pointCloud: SCPointCloud
-                if self.usesDeviceMotionGravity, let gravity = self._captureState.gravity {
-                    pointCloud = rawCloud.settingGravity(gravity)
-                } else if self.usesDeviceMotionGravity {
-                    let message = "No stable depth frames were captured. Keep the whole foot and some floor in view, then try again."
-                    self._finishDiagnostics(rawCloud.settingGravity(.zero), reason: message) {
-                        self._reconstructionManager.reset()
-                        self._isCompletingCapture = false
-                        guard self._captureLifetime.accepts(completionGeneration) else { return }
-                        self.delegate?.scanningViewController?(self, didFail: message)
-                    }
-                    return
-                } else {
-                    pointCloud = rawCloud
-                }
-
-                self._finishDiagnostics(pointCloud, reason: "Capture finished; geometry not yet validated") {
-                    self._reconstructionManager.reset()
-                    self._isCompletingCapture = false
-                    guard self._captureLifetime.accepts(completionGeneration) else { return }
-                    self.delegate?.scanningViewController?(self, didScan: pointCloud)
-                }
+            _cameraManager.stopSession { [self] in
+                _finishReconstruction(completionGeneration: completionGeneration)
             }
         } else {
             _reconstructionManager.reset()
@@ -397,7 +368,7 @@ import UIKit
                     if !usable && !wasRecovering {
                         self.delegate?.scanningViewController?(self, trackingIsStable: false)
                     }
-                    if expired && !self.recordsScanDiagnostics {
+                    if expired && !self.isReplayOnlyCapture {
                         self._failCapture("Depth detail did not recover. Keep the whole foot and some floor visible at about 30–40 cm, then try again.")
                         shouldAccumulate = false
                     }
@@ -519,7 +490,7 @@ import UIKit
                 if _captureState.shouldStopForTrackingLoss(
                     now: ProcessInfo.processInfo.systemUptime, grace: trackingRecoveryTime
                 ) {
-                    if !recordsScanDiagnostics {
+                    if !isReplayOnlyCapture {
                         _failCapture("Tracking was lost. Return to the last angle, move more slowly and keep the foot still. Start with the whole foot and some floor visible.")
                     }
                 }
@@ -537,7 +508,7 @@ import UIKit
         print("SCReconstructionManager hit API error: \(error)")
         if let recorder = _diagnostics {
             recorder.recordEvent("fusion_api_error", fields: ["message": error.localizedDescription])
-            return
+            if isReplayOnlyCapture { return }
         }
         _failCapture("The depth camera was interrupted. Close the scanner and try again.")
     }
@@ -559,6 +530,7 @@ import UIKit
             "focalLengthScaleFactor": cameraFocalLengthScaleFactor, "minimumCaptureDistance": minimumCaptureDistance,
             "maximumCaptureDistance": maximumCaptureDistance, "usesDeviceMotionGravity": usesDeviceMotionGravity,
             "maxDepthResolution": maxDepthResolution, "trackingRecoveryTime": trackingRecoveryTime,
+            "reconstructsRecordedScan": reconstructsRecordedScan,
             "flipsInputHorizontally": mirrorModeEnabled, "normalizedFrameClipRegion": [0,0,0,0]
         ]) { [weak self] message in self?._failCapture(message) }
         _diagnostics = recorder
@@ -568,70 +540,100 @@ import UIKit
         }
     }
 
-    private func _stopDiagnosticCapture(reason: String, incomplete: Bool) {
+    private func _stopDiagnosticCapture(reason: String, incomplete: Bool,
+                                        reconstruct: Bool = false, failureMessage: String? = nil) {
         guard !_isCompletingCapture, let recorder = _diagnostics else { return }
         _isCompletingCapture = true
         _captureLifetime.invalidate()
+        let completionGeneration = _captureLifetime.generation
+        let deliversModel = reconstructsRecordedScan
         _state = .default
+        _latestViewMatrix = matrix_identity_float4x4
+        _updateUI()
         _cameraManager.stopSession { [self] in
             // Session stop drains camera callbacks. Seal the captured RGBD prefix
-            // even if fusion is still busy, tracking failed or no points exist.
-            _reconstructionManager.reset()
+            // before waiting for fusion or validating any foot geometry.
             recorder.finish(reason: reason, gravity: _captureState.gravity, incomplete: incomplete) { [self] url in
                 _diagnostics = nil
                 _reconstructionManager.diagnosticEventHandler = nil
-                if let url { delegate?.scanningViewController?(self, didWriteDiagnostics: url) }
-                else { delegate?.scanningViewController?(self, didFail: "The private recording could not be saved.") }
+                guard _captureLifetime.accepts(completionGeneration) else {
+                    _reconstructionManager.reset()
+                    meshTexturing.reset()
+                    _isCompletingCapture = false
+                    return
+                }
+                if let url {
+                    delegate?.scanningViewController?(self, didWriteDiagnostics: url)
+                }
+                guard _captureLifetime.accepts(completionGeneration) else {
+                    _reconstructionManager.reset()
+                    meshTexturing.reset()
+                    _isCompletingCapture = false
+                    return
+                }
+                guard url != nil else {
+                    _reconstructionManager.reset()
+                    meshTexturing.reset()
+                    _isCompletingCapture = false
+                    delegate?.scanningViewController?(self, didFail: "The private recording could not be saved.")
+                    return
+                }
+                if reconstruct {
+                    _finishReconstruction(completionGeneration: completionGeneration)
+                } else {
+                    _reconstructionManager.reset()
+                    meshTexturing.reset()
+                    _isCompletingCapture = false
+                    if deliversModel {
+                        if let failureMessage {
+                            delegate?.scanningViewController?(self, didFail: failureMessage)
+                        } else {
+                            delegate?.scanningViewControllerDidCancel(self)
+                        }
+                    }
+                }
             }
         }
     }
 
-    private func _finishDiagnostics(_ cloud: SCPointCloud, reason: String, completion: @escaping () -> Void) {
-        guard let recorder = _diagnostics else { completion(); return }
-        _diagnostics = nil
-        let diagnosticGeneration = _captureLifetime.generation
-        recorder.finish(reason: reason, gravity: cloud.gravity) { url in
-            if self._captureLifetime.accepts(diagnosticGeneration), let url = url {
-                self.delegate?.scanningViewController?(self, didWriteDiagnostics: url)
+    /// Raw recording has already been sealed (when enabled). A reconstruction
+    /// failure cannot remove it or prevent its diagnostics callback.
+    private func _finishReconstruction(completionGeneration: UInt) {
+        guard _captureLifetime.accepts(completionGeneration) else {
+            _reconstructionManager.reset()
+            _isCompletingCapture = false
+            return
+        }
+        meshTexturing.cameraCalibrationData = _reconstructionManager.latestCameraCalibrationData
+        meshTexturing.cameraCalibrationFrameWidth = _reconstructionManager.latestCameraCalibrationFrameWidth
+        meshTexturing.cameraCalibrationFrameHeight = _reconstructionManager.latestCameraCalibrationFrameHeight
+        _reconstructionManager.finalize { [self] in
+            guard _captureLifetime.accepts(completionGeneration) else {
+                _reconstructionManager.reset()
+                _isCompletingCapture = false
+                return
             }
-            completion()
+            let rawCloud = _reconstructionManager.buildPointCloud()
+            let pointCloud = rawCloud.settingGravity(_captureState.gravity ?? .zero)
+            _reconstructionManager.reset()
+            _isCompletingCapture = false
+            if usesDeviceMotionGravity && _captureState.gravity == nil {
+                delegate?.scanningViewController?(self, didFail:
+                    "No stable depth frames were captured. Keep the whole foot and some floor in view, then try again.")
+            } else {
+                delegate?.scanningViewController?(self, didScan: usesDeviceMotionGravity ? pointCloud : rawCloud)
+            }
         }
     }
 
     private func _failCapture(_ message: String) {
-        if _diagnostics != nil {
-            _stopDiagnosticCapture(reason: message, incomplete: true)
-            return
-        }
         guard !_isCompletingCapture else { return }
-        guard _diagnostics != nil else {
-            stopScanning(reason: .canceled)
-            if delegate?.scanningViewController?(self, didFail: message) == nil { _showScanFailedMessage() }
+        if _diagnostics != nil {
+            _stopDiagnosticCapture(reason: message, incomplete: true, failureMessage: message)
             return
         }
-        // Snapshot only after the model queue is quiescent; reset would destroy the evidence.
-        _isCompletingCapture = true
-        _captureLifetime.invalidate()
-        let completionGeneration = _captureLifetime.generation
-        _state = .default
-        _updateUI()
-        _cameraManager.stopSession()
-        _reconstructionManager.finalize {
-            guard self._captureLifetime.accepts(completionGeneration) else {
-                self._diagnostics = nil
-                self._reconstructionManager.reset()
-                self._isCompletingCapture = false
-                return
-            }
-            let cloud = self._reconstructionManager.buildPointCloud().settingGravity(self._captureState.gravity ?? .zero)
-            self._finishDiagnostics(cloud, reason: message) {
-                self._reconstructionManager.reset()
-                self.meshTexturing.reset()
-                self._isCompletingCapture = false
-                guard self._captureLifetime.accepts(completionGeneration) else { return }
-                if self.delegate?.scanningViewController?(self, didFail: message) == nil { self._showScanFailedMessage() }
-            }
-        }
+        stopScanning(reason: .canceled)
+        if delegate?.scanningViewController?(self, didFail: message) == nil { _showScanFailedMessage() }
     }
 
     // MARK: - Private properties
@@ -751,7 +753,10 @@ import UIKit
                 break
             case .configurationFailed:
                 print("Configuration failed for an unknown reason")
-                if self._diagnostics != nil { self._stopDiagnosticCapture(reason: "Camera configuration failed before capture", incomplete: true) }
+                if self._diagnostics != nil {
+                    self._stopDiagnosticCapture(reason: "Camera configuration failed before capture", incomplete: true,
+                                                failureMessage: "The depth camera could not be configured. Close the scanner and try again.")
+                }
             case .notAuthorized:
                 let message = "To take a 3D scan, go to your privacy settings. Tap Camera and turn on for Capture"
                 let alertController = UIAlertController(title: "Camera Access", message: message, preferredStyle: .alert)
@@ -850,7 +855,13 @@ import UIKit
     }
     
     @objc private func dismissTapped(_ sender: UIButton?) {
-        delegate?.scanningViewControllerDidCancel(self)
+        if _diagnostics != nil {
+            // Keep the scanner alive until its durable prefix has been closed.
+            stopScanning(reason: .canceled)
+        } else {
+            // Raw data is already durable; model finalization must not trap the user.
+            delegate?.scanningViewControllerDidCancel(self)
+        }
     }
     
 }
