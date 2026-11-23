@@ -17,6 +17,7 @@ public class DefaultScanningViewRenderer: ScanningViewRenderer {
     private let _pointCloudRenderer: PointCloudCommandEncoder
     
     public var flipsInputHorizontally: Bool = false
+    var cameraFocalLengthScaleFactor: Float = 1.019
     
     required public init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         _commandQueue = commandQueue
@@ -47,13 +48,18 @@ public class DefaultScanningViewRenderer: ScanningViewRenderer {
             }
             
             if let pointCloud = pointCloud {
+                let colorSize = colorBuffer.map {
+                    SIMD2(Float(CVPixelBufferGetWidth($0)), Float(CVPixelBufferGetHeight($0)))
+                }
                 _pointCloudRenderer.encodeCommands(onto: commandBuffer,
                                                    pointCloud: pointCloud,
                                                    depthCameraCalibrationData: depthCameraCalibrationData,
                                                    viewMatrix: viewMatrix,
                                                    pointSize: 16,
                                                    flipsInputHorizontally: flipsInputHorizontally,
-                                                   outputTexture: outputTexture)
+                                                   outputTexture: outputTexture,
+                                                   colorSize: colorSize,
+                                                   focalLengthScale: cameraFocalLengthScaleFactor)
             }
             
             commandBuffer.present(drawable)

@@ -249,6 +249,7 @@ import UIKit
         _reconstructionManager.delegate = self
         _reconstructionManager.includesColorBuffersInMetadata = generatesTexturedMeshes
         _reconstructionManager.cameraFocalLengthScaleFactor = cameraFocalLengthScaleFactor
+        (scanningViewRenderer as? DefaultScanningViewRenderer)?.cameraFocalLengthScaleFactor = cameraFocalLengthScaleFactor
         if reconstructionIterationLimit > 0 { _reconstructionManager.maxICPIterations = reconstructionIterationLimit }
         if maximumReconstructionDepth > 0 {
             _reconstructionManager.maxDepth = maximumReconstructionDepth
@@ -373,8 +374,11 @@ import UIKit
         DispatchQueue.main.sync {
             isScanning = self._state == .scanning
             generation = self._captureLifetime.generation
-            if isScanning { recorder = self._diagnostics; motion = self._motionManager.deviceMotion }
-            viewMatrix = self._latestViewMatrix
+            if isScanning {
+                recorder = self._diagnostics
+                motion = self._motionManager.deviceMotion
+                viewMatrix = self._latestViewMatrix
+            }
             let now = ProcessInfo.processInfo.systemUptime
             if self.minimumCaptureDistance > 0 {
                 self._updateDepthGuidance(depthBuffer)

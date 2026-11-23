@@ -20,9 +20,10 @@ kernel void DrawColorTexture(texture2d<float, access::sample> colorTexture [[tex
                              constant Uniforms *uniforms [[buffer(0)]],
                              uint2 gid [[thread_position_in_grid]])
 {
+    if (gid.x >= resultTexture.get_width() || gid.y >= resultTexture.get_height()) { return; }
     constexpr sampler colorSampler(coord::normalized, address::clamp_to_edge, filter::linear);
     
-    float2 uv = (uniforms->transform * float3(float2(gid), 1.0)).xy;
+    float2 uv = (uniforms->transform * float3(float2(gid) + 0.5, 1.0)).xy;
     
     float4 color = colorTexture.sample(colorSampler, uv);
     color *= uniforms->alpha;

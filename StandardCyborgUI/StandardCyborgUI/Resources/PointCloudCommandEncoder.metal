@@ -22,8 +22,8 @@ struct ProjectedVertex {
 };
 
 struct Uniforms {
-    float3x3 normalMatrix;
     float4x4 modelView;
+    float3x3 normalMatrix;
     float4x4 modelViewProjection;
     float pointSize;
 };

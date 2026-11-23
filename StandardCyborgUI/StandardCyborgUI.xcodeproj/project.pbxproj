@@ -13,6 +13,7 @@
 		7620D25B21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25A21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift */; };
 		7620D26221CDADA5008D0095 /* DrawColorTexture.metal in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25C21CDADA5008D0095 /* DrawColorTexture.metal */; };
 		7620D26321CDADA5008D0095 /* AspectFillTextureCommandEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25D21CDADA5008D0095 /* AspectFillTextureCommandEncoder.swift */; };
+		BD5C72983000000000000002 /* ScanPreviewProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = BD5C72983000000000000001 /* ScanPreviewProjection.swift */; };
 		7620D26421CDADA5008D0095 /* ScanningViewRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25E21CDADA5008D0095 /* ScanningViewRenderer.swift */; };
 		7620D26521CDADA5008D0095 /* PointCloudCommandEncoder.metal in Sources */ = {isa = PBXBuildFile; fileRef = 7620D25F21CDADA5008D0095 /* PointCloudCommandEncoder.metal */; };
 		7620D26721CDADA5008D0095 /* PointCloudCommandEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7620D26121CDADA5008D0095 /* PointCloudCommandEncoder.swift */; };
@@ -42,6 +43,7 @@
 		7620D25A21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ScanningHapticFeedbackEngine.swift; sourceTree = "<group>"; };
 		7620D25C21CDADA5008D0095 /* DrawColorTexture.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = DrawColorTexture.metal; sourceTree = "<group>"; };
 		7620D25D21CDADA5008D0095 /* AspectFillTextureCommandEncoder.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AspectFillTextureCommandEncoder.swift; sourceTree = "<group>"; };
+		BD5C72983000000000000001 /* ScanPreviewProjection.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ScanPreviewProjection.swift; sourceTree = "<group>"; };
 		7620D25E21CDADA5008D0095 /* ScanningViewRenderer.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = ScanningViewRenderer.swift; sourceTree = "<group>"; };
 		7620D25F21CDADA5008D0095 /* PointCloudCommandEncoder.metal */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.metal; path = PointCloudCommandEncoder.metal; sourceTree = "<group>"; };
 		7620D26121CDADA5008D0095 /* PointCloudCommandEncoder.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = PointCloudCommandEncoder.swift; sourceTree = "<group>"; };
@@ -110,6 +112,7 @@
 				762D925B2A25AE7700399490 /* ScenePreviewViewController.swift */,
 				7620D25C21CDADA5008D0095 /* DrawColorTexture.metal */,
 				7620D25D21CDADA5008D0095 /* AspectFillTextureCommandEncoder.swift */,
+				BD5C72983000000000000001 /* ScanPreviewProjection.swift */,
 				7620D26121CDADA5008D0095 /* PointCloudCommandEncoder.swift */,
 				7620D25F21CDADA5008D0095 /* PointCloudCommandEncoder.metal */,
 				A080752E22D3B3FF00D1CFD8 /* Bundle+SCUI.swift */,
@@ -228,6 +231,7 @@
 				7620D25B21CDAD69008D0095 /* ScanningHapticFeedbackEngine.swift in Sources */,
 				7642B7E521E55E9A00BC45C7 /* DefaultScanningViewRenderer.swift in Sources */,
 				7620D26321CDADA5008D0095 /* AspectFillTextureCommandEncoder.swift in Sources */,
+				BD5C72983000000000000002 /* ScanPreviewProjection.swift in Sources */,
 				7620D26521CDADA5008D0095 /* PointCloudCommandEncoder.metal in Sources */,
 				7620D26721CDADA5008D0095 /* PointCloudCommandEncoder.swift in Sources */,
 				7620D26221CDADA5008D0095 /* DrawColorTexture.metal in Sources */,
