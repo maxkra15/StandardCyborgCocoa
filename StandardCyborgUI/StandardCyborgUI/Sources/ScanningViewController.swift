@@ -44,6 +44,9 @@ import UIKit
     public var maximumReconstructionDepth: Float = 0
     /// Allow rejected frames to recover against the last good model before ending.
     public var trackingRecoveryTime: TimeInterval = 0
+    /// Keep the fused model and continue trying during depth or tracking recovery.
+    /// The presenting flow should provide a duration bound and a Finish control.
+    public var keepsCaptureOpenDuringRecovery = false
     private let _motionManager = CMMotionManager()
     private var _captureState = ScanCaptureState()
     public var recordsScanDiagnostics = false
@@ -100,7 +103,7 @@ import UIKit
         
         switch _state {
         case .default:
-            guard _cameraManager.isSessionRunning else { return }
+            guard _cameraManager.isSessionRunning, _hasStartingDepth() else { return }
             _startCountdown { self.startScanning() }
         case .countdownSeconds(let seconds):
             if seconds > 0 {
@@ -116,9 +119,8 @@ import UIKit
     /** Starts scanning immediately */
     @objc public func startScanning() {
         guard !_isCompletingCapture else { return }
-        if !isReplayOnlyCapture && minimumCaptureDistance > 0 && (_depthGuidance?.allowsStart != true || ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime > 1) {
+        guard _hasStartingDepth() else {
             _state = .default
-            delegate?.scanningViewController?(self, captureGuidance: _depthGuidance?.message ?? "Aim at the whole foot and wait for depth detail.")
             return
         }
         _captureLifetime.invalidate()
@@ -135,6 +137,17 @@ import UIKit
         _state = .scanning
         _assimilatedFrameIndex = 0
         meshTexturing.reset()
+    }
+
+    private func _hasStartingDepth() -> Bool {
+        guard !isReplayOnlyCapture && minimumCaptureDistance > 0 else { return true }
+        let fresh = ProcessInfo.processInfo.systemUptime - _lastDepthGuidanceTime <= 1
+        guard fresh && _depthGuidance?.allowsStart == true else {
+            let guidance = fresh ? _depthGuidance?.message : nil
+            delegate?.scanningViewController?(self, captureGuidance: guidance ?? "Keep your whole foot and some floor in view")
+            return false
+        }
+        return true
     }
 
     /// An immutable observed-point snapshot for background geometry checks.
@@ -377,12 +390,13 @@ import UIKit
                     let usable = hasTracked
                         ? self._depthGuidance?.allowsTracking == true
                         : self._depthGuidance?.allowsStart == true
-                    let expired = self._captureState.updateDepthUsable(usable, now: now, grace: 8)
+                    let expired = self._captureState.updateDepthUsable(usable, now: now, grace: 8,
+                        waitForTrackedFrame: self.keepsCaptureOpenDuringRecovery)
                     shouldAccumulate = usable
                     if !usable && !wasRecovering {
                         self.delegate?.scanningViewController?(self, trackingIsStable: false)
                     }
-                    if expired && !self.isReplayOnlyCapture {
+                    if expired && !self.isReplayOnlyCapture && !self.keepsCaptureOpenDuringRecovery {
                         let explanation = self._depthGuidance?.interruptionMessage ?? self._depthGuidance?.message
                         self._failCapture(explanation ?? "Depth detail did not recover. Keep the whole foot and some floor visible, then try again.")
                         shouldAccumulate = false
@@ -437,14 +451,13 @@ import UIKit
             DispatchQueue.main.sync {
                 guard self._state == .scanning, !self._isCompletingCapture,
                       self._captureLifetime.accepts(generation) else { return }
+                let inputSequence = diagnosticSequence ?? self._captureState.nextTrackingInputSequence
+                self._captureState.recordTrackingSubmission(inputSequence)
                 if let recorder, let diagnosticSequence {
                     recorder.recordEvent("fusion_submitted", fields: ["inputSequence": diagnosticSequence])
-                    self._reconstructionManager.accumulate(depthBuffer: depthBuffer, colorBuffer: colorBuffer,
-                        calibrationData: depthCalibrationData, diagnosticSequence: diagnosticSequence)
-                } else {
-                    self._reconstructionManager.accumulate(depthBuffer: depthBuffer, colorBuffer: colorBuffer,
-                        calibrationData: depthCalibrationData)
                 }
+                self._reconstructionManager.accumulate(depthBuffer: depthBuffer, colorBuffer: colorBuffer,
+                    calibrationData: depthCalibrationData, diagnosticSequence: inputSequence)
             }
         }
     }
@@ -479,7 +492,7 @@ import UIKit
         
         _diagnostics?.recordTracking(metadata, statistics: statistics)
         // Late metadata from a frame queued before a depth pause cannot clear that pause.
-        guard !_captureState.isDepthPaused else { _publishCaptureProgress(); return }
+        guard _captureState.acceptsTrackingResult(metadata.inputSequence) else { _publishCaptureProgress(); return }
         switch metadata.result {
         case .succeeded, .poorTracking:
             _latestViewMatrix = metadata.viewMatrix
@@ -502,14 +515,14 @@ import UIKit
             _assimilatedFrameIndex += 1
             
         case .failed, .lostTracking:
-            if trackingRecoveryTime > 0 {
+            if trackingRecoveryTime > 0 || keepsCaptureOpenDuringRecovery {
                 if !_captureState.isRecovering {
                     delegate?.scanningViewController?(self, trackingIsStable: false)
                 }
                 if _captureState.shouldStopForTrackingLoss(
                     now: ProcessInfo.processInfo.systemUptime, grace: trackingRecoveryTime
                 ) {
-                    if !isReplayOnlyCapture {
+                    if !isReplayOnlyCapture && !keepsCaptureOpenDuringRecovery {
                         _failCapture("Tracking was lost. Return to the last angle, move more slowly and keep the foot still. Start with the whole foot and some floor visible.")
                     }
                 }
@@ -538,7 +551,7 @@ import UIKit
 
     private func _publishCaptureProgress() {
         let guidance = _captureState.isDepthPaused ? _depthGuidance?.message :
-            (_captureState.isRecovering ? "Return to the last angle and move slowly." : nil)
+            (_captureState.isRecovering ? "Return to your last angle" : nil)
         onCaptureProgress?(_captureState.progress(guidance: guidance))
     }
 
@@ -550,6 +563,7 @@ import UIKit
             "minimumTrackingDistance": minimumTrackingDistance,
             "maximumCaptureDistance": maximumCaptureDistance, "usesDeviceMotionGravity": usesDeviceMotionGravity,
             "maxDepthResolution": maxDepthResolution, "trackingRecoveryTime": trackingRecoveryTime,
+            "keepsCaptureOpenDuringRecovery": keepsCaptureOpenDuringRecovery,
             "reconstructsRecordedScan": reconstructsRecordedScan,
             "gravityCoordinateFrame": "fusion_camera_v1",
             "flipsInputHorizontally": mirrorModeEnabled, "normalizedFrameClipRegion": [0,0,0,0]

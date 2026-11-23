@@ -12,17 +12,16 @@ struct ScanDepthGuidance {
         let valid = samples.filter { $0.isFinite && $0 > 0 && $0 < 2 }.sorted()
         guard !samples.isEmpty, valid.count >= max(12, samples.count / 5) else {
             medianMetres = nil
-            message = "Aim at the whole foot and some floor. Depth detail is missing."
+            message = "Keep your whole foot and some floor in view"
             interruptionMessage = "Depth detail did not recover. Keep the whole foot and some floor visible at about 30–40 cm, then try again."
             return
         }
         let median = valid[valid.count / 2]
         medianMetres = median
-        let distance = Int((median * 100).rounded())
         if median < minimumDistance {
-            message = "Move farther away · about \(distance) cm now. Aim for 30–40 cm."
+            message = "Move back so your heel and toes fit"
         } else if median > maximumDistance {
-            message = "Move closer · about \(distance) cm now. Aim for 30–40 cm."
+            message = "Move a little closer"
         } else {
             message = nil
         }

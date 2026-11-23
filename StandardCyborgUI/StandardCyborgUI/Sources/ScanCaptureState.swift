@@ -23,6 +23,8 @@ struct ScanCaptureState {
     private(set) var gravity: SIMD3<Float>?
     private var trackingLostAt: TimeInterval?
     private var depthPausedAt: TimeInterval?
+    private var lastSubmittedInputSequence = -1
+    private var prePauseInputSequence: Int?
     private var lastAcceptedAt: TimeInterval?
     private var firstCameraPosition: SIMD3<Float>?
     private var firstCameraDirection: SIMD3<Float>?
@@ -31,7 +33,8 @@ struct ScanCaptureState {
     private(set) var viewpointSpanRadians: Float = 0
     private(set) var cameraTranslationMetres: Float = 0
     var isDepthPaused: Bool { depthPausedAt != nil }
-    var isRecovering: Bool { trackingLostAt != nil || isDepthPaused }
+    var isRecovering: Bool { trackingLostAt != nil || isDepthPaused || prePauseInputSequence != nil }
+    var nextTrackingInputSequence: Int { lastSubmittedInputSequence + 1 }
 
     mutating func begin() { self = ScanCaptureState() }
 
@@ -44,11 +47,25 @@ struct ScanCaptureState {
         return true
     }
 
-    mutating func trackingRecovered() { trackingLostAt = nil }
+    mutating func recordTrackingSubmission(_ inputSequence: Int) {
+        lastSubmittedInputSequence = inputSequence
+    }
+
+    func acceptsTrackingResult(_ inputSequence: Int) -> Bool {
+        guard !isDepthPaused else { return false }
+        guard let prePauseInputSequence else { return true }
+        return inputSequence > prePauseInputSequence
+    }
+
+    mutating func trackingRecovered() {
+        trackingLostAt = nil
+        prePauseInputSequence = nil
+    }
 
     /// Hold the existing model while the sensor has no usable nearby depth.
     /// This never restarts fusion with a different reference frame.
-    mutating func updateDepthUsable(_ usable: Bool, now: TimeInterval, grace: TimeInterval) -> Bool {
+    mutating func updateDepthUsable(_ usable: Bool, now: TimeInterval, grace: TimeInterval,
+                                    waitForTrackedFrame: Bool = false) -> Bool {
         guard now.isFinite else { return true }
         if usable {
             depthPausedAt = nil
@@ -56,7 +73,13 @@ struct ScanCaptureState {
         }
         lastAcceptedAt = nil
         trackingLostAt = nil
-        if depthPausedAt == nil { depthPausedAt = now }
+        if depthPausedAt == nil {
+            depthPausedAt = now
+            if waitForTrackedFrame {
+                // Results submitted before losing usable depth cannot end recovery.
+                prePauseInputSequence = lastSubmittedInputSequence
+            }
+        }
         return now - (depthPausedAt ?? now) >= grace
     }
 
